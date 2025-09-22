@@ -1,142 +1,129 @@
-import logging
+import os
 import json
 import random
-import os
+import logging
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils.executor import set_webhook
 
-API_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_PATH = "/webhook"
-WEBAPP_HOST = "0.0.0.0"
-WEBAPP_PORT = int(os.getenv("PORT", 8080))
-
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+# 🔹 Логирование
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tarot-bot")
 
-bot = Bot(token=API_TOKEN)
+# 🔹 Переменные окружения
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
+WEBAPP_HOST = "0.0.0.0"
+WEBAPP_PORT = int(os.getenv("PORT", 5000))
+
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
-# === Загружаем колоду ===
+# 🔹 Загружаем колоду
 with open("data/deck.json", "r", encoding="utf-8") as f:
-    TAROT_DECK = json.load(f)
-logger.info("Колода загружена локально из data/deck.json")
+    DECK = json.load(f)
 
-# === Клавиатуры ===
+# 🔹 Клавиатура меню
 def menu_kb():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(types.KeyboardButton("❤️ Отношения"),
-           types.KeyboardButton("💼 Работа"),
-           types.KeyboardButton("💰 Финансы"))
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(KeyboardButton("Отношения 💞"))
+    kb.add(KeyboardButton("Работа ⚒️"))
+    kb.add(KeyboardButton("Финансы 💰"))
+    kb.add(KeyboardButton("Общий расклад 🔮"))
     return kb
 
-def spreads_kb():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(types.KeyboardButton("🔮 3 карты"),
-           types.KeyboardButton("🌟 5 карт"),
-           types.KeyboardButton("✨ Кельтский крест"))
-    return kb
-
-# === Хранилище состояния пользователей ===
+# 🔹 Состояние пользователей (что выбрали и ждём ли описания)
 user_state = {}
 
-# === Итоговые шаблоны ===
-SUMMARY_TEMPLATES = [
-    "✨ Итог расклада:\nТема: *{theme}*\nЗапрос: _{situation}_\n\n"
-    "Карты указывают, что судьба открывает перед вами новые возможности. Главное — слушать свою интуицию и не спешить с решениями.",
+# 📌 Итоговый анализ как у таролога
+def generate_summary(theme, situation, cards):
+    texts = []
+    for c in cards:
+        texts.append(f"— {c['name']}: {c['meaning']}")
+    cards_text = "\n".join(texts)
 
-    "🌟 Заключение:\nВы выбрали тему *{theme}*, описали её так: _{situation}_.\n\n"
-    "Расклад советует обратить внимание на внутреннюю гармонию. В ближайшее время обстоятельства будут складываться в вашу пользу, если действовать осознанно.",
+    # Развёрнутый вывод
+    summary = (
+        f"✨ Тема: {theme}\n"
+        f"Ваш запрос: {situation}\n\n"
+        f"Карты, которые выпали:\n{cards_text}\n\n"
+        f"🔮 Итог расклада:\n"
+        f"В раскладе проявляется важный поворот: каждая карта указывает на внутренние процессы, "
+        f"которые вы уже чувствуете. Здесь есть подсказка — обратить внимание не только на внешние "
+        f"события, но и на своё отношение к ним. Совет расклада: сохранять ясность, доверять "
+        f"своему опыту и не бояться перемен. У вас достаточно ресурсов и поддержки, чтобы выйти "
+        f"на новый уровень. Главное — слушать сердце и действовать уверенно."
+    )
+    return summary
 
-    "🔮 Совет карт:\nВаш запрос: _{situation}_ (сфера: *{theme}*).\n\n"
-    "Карты говорят о переменах и возможностях для роста. Итог — держите сердце и разум открытыми, тогда вы получите больше, чем ожидаете.",
-
-    "🌌 Послание расклада:\nТема *{theme}* связана с вашим вопросом: _{situation}_.\n\n"
-    "Карты показывают, что сейчас важно сделать паузу, переосмыслить происходящее и довериться процессу. Время работает на вас."
-]
-
-# === Обработчики ===
+# 🔹 Команда /start
 @dp.message_handler(commands=["start"])
 async def cmd_start(m: types.Message):
-    user_state[m.from_user.id] = {}
-    await m.answer("Привет! Я Таро-бот 🎴\nВыберите сферу для расклада:", reply_markup=menu_kb())
-
-@dp.message_handler(commands=["menu"])
-async def cmd_menu(m: types.Message):
-    user_state[m.from_user.id] = {}
-    await m.answer("Выберите сферу для расклада:", reply_markup=menu_kb())
-
-@dp.message_handler(lambda m: m.text in ["❤️ Отношения", "💼 Работа", "💰 Финансы"])
-async def choose_theme(m: types.Message):
-    user_state[m.from_user.id] = {"theme": m.text}
     await m.answer(
-        "✍️ Опишите, пожалуйста, вашу ситуацию своими словами.\n"
-        "Например: 'Мы с Сергеем поссорились и я хочу понять, есть ли будущее' или 'Стоит ли менять работу'."
-    )
-
-@dp.message_handler(lambda m: m.from_user.id in user_state and "theme" in user_state[m.from_user.id] and "situation" not in user_state[m.from_user.id])
-async def save_situation(m: types.Message):
-    user_state[m.from_user.id]["situation"] = m.text
-    await m.answer("Спасибо 🙏 Теперь выберите расклад:", reply_markup=spreads_kb())
-
-@dp.message_handler(lambda m: m.text in ["🔮 3 карты", "🌟 5 карт", "✨ Кельтский крест"])
-async def do_spread(m: types.Message):
-    user = user_state.get(m.from_user.id, {})
-    theme = user.get("theme", "Общее")
-    situation = user.get("situation", "Без описания")
-
-    num_cards = 3 if "3" in m.text else (5 if "5" in m.text else 10)
-    drawn_cards = random.sample(TAROT_DECK, num_cards)
-
-    interpretation = []
-    for card in drawn_cards:
-        if isinstance(card.get("meanings"), list):
-            meaning = random.choice(card["meanings"])
-        else:
-            meaning = card.get("meaning", "Смысл не найден")
-        interpretation.append(f"🃏 {card['name']} — {meaning}")
-
-    summary_template = random.choice(SUMMARY_TEMPLATES)
-    summary = summary_template.format(theme=theme, situation=situation)
-
-    await m.answer(
-        f"Ваш расклад ({m.text}):\n\n" + "\n\n".join(interpretation) + "\n\n" + summary,
-        parse_mode="Markdown",
+        "Привет! Я Таро-бот 🔮\n"
+        "Выберите тему для расклада:",
         reply_markup=menu_kb()
     )
 
+# 🔹 Обработка выбора темы
+@dp.message_handler(lambda m: m.text in ["Отношения 💞", "Работа ⚒️", "Финансы 💰", "Общий расклад 🔮"])
+async def on_theme(m: types.Message):
+    user_state[m.from_user.id] = {"theme": m.text, "awaiting_situation": True}
+    await m.answer(
+        f"Вы выбрали тему: *{m.text}*\n\n"
+        "Теперь опишите свою ситуацию подробнее (например: «отношения с Иваном», "
+        "«устроился в новую фирму» или «беспокоит стабильность дохода»).",
+        parse_mode="Markdown"
+    )
+
+# 🔹 Получение описания ситуации и расклад
+@dp.message_handler(lambda m: m.from_user.id in user_state and user_state[m.from_user.id].get("awaiting_situation"))
+async def on_situation(m: types.Message):
+    state = user_state[m.from_user.id]
+    theme = state["theme"]
+    situation = m.text
+
+    # 3 случайные карты
+    cards = random.sample(DECK, 3)
+
+    # Итоговый текст
+    summary = generate_summary(theme, situation, cards)
+
+    # Отправляем результат
+    await m.answer(summary)
+
+    # Сбрасываем состояние
+    user_state.pop(m.from_user.id, None)
+
+# 🔹 Любое другое сообщение
 @dp.message_handler()
-async def fallback(m: types.Message):
-    await m.answer("Пожалуйста, выберите тему через /menu или кнопки ниже.", reply_markup=menu_kb())
+async def on_free_text(m: types.Message):
+    await m.answer("Выберите тему через меню ниже 👇", reply_markup=menu_kb())
 
-# === Aiohttp сервер для вебхука ===
-async def webhook_handler(request):
-    try:
-        data = await request.json()
-    except Exception:
-        return web.Response(status=400)
-    update = types.Update.to_object(data)
-    await dp.process_update(update)
-    return web.Response(text="ok")
-
+# 🔹 Aiohttp веб-сервер
 async def on_startup(app):
-    webhook_url = os.getenv("RENDER_EXTERNAL_URL") + WEBHOOK_PATH
-    try:
-        await bot.set_webhook(webhook_url)
-        logger.info(f"Webhook успешно установлен: {webhook_url}")
-    except Exception as e:
-        logger.error(f"Ошибка при установке webhook: {e}")
+    await bot.delete_webhook()
+    await bot.set_webhook(WEBHOOK_URL)
+    logger.info(f"Webhook установлен: {WEBHOOK_URL}")
 
 async def on_shutdown(app):
-    logger.info("Удаляем webhook...")
     await bot.delete_webhook()
+    await bot.close()
 
-def main():
-    app = web.Application()
-    app.router.add_post(WEBHOOK_PATH, webhook_handler)
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-    web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)
+async def webhook_handler(request):
+    data = await request.json()
+    update = types.Update.to_object(data)
+    await dp.process_update(update)
+    return web.Response()
+
+app = web.Application()
+app.router.add_post(WEBHOOK_PATH, webhook_handler)
+app.on_startup.append(on_startup)
+app.on_shutdown.append(on_shutdown)
 
 if __name__ == "__main__":
-    main()
+    web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)
