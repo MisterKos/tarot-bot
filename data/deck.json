@@ -2,7 +2,8 @@
   "code": "rw",
   "name_en": "Rider-Waite (classic)",
   "name_ru": "Райдер–Уэйт (классика)",
-  "image_base_url": "/decks/rw/cards/",
+  "image_base_url": "image_base_url": "https://cdn.jsdelivr.net/gh/MisterKos/tarot-bot@main/assets/rw/cards/"
+",
   "reversals_percent": 30,
   "cards": [
     {
