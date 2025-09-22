@@ -1,225 +1,142 @@
-import os
+import logging
 import json
 import random
-import logging
-from typing import List, Dict
+import os
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.utils.executor import Executor
+from aiogram.utils.executor import set_webhook
 
-# ------------------------------------------------------------
-# Логирование
-# ------------------------------------------------------------
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("tarot-bot")
+API_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_PATH = "/webhook"
+WEBAPP_HOST = "0.0.0.0"
+WEBAPP_PORT = int(os.getenv("PORT", 8080))
 
-# ------------------------------------------------------------
-# Конфиг
-# ------------------------------------------------------------
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+logger = logging.getLogger("tarot-bot")
 
-if not TOKEN:
-    raise RuntimeError("Не указан BOT_TOKEN")
-
-bot = Bot(token=TOKEN, parse_mode=types.ParseMode.HTML)
+bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
-# ------------------------------------------------------------
-# Загрузка колоды
-# ------------------------------------------------------------
-DECK_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "deck.json")
-with open(DECK_PATH, "r", encoding="utf-8") as f:
-    DECK = json.load(f)
+# === Загружаем колоду ===
+with open("data/deck.json", "r", encoding="utf-8") as f:
+    TAROT_DECK = json.load(f)
+logger.info("Колода загружена локально из data/deck.json")
 
-log.info("Колода загружена локально из data/deck.json")
-
-# ------------------------------------------------------------
-# Утилиты для клавиатуры
-# ------------------------------------------------------------
+# === Клавиатуры ===
 def menu_kb():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("🔮 Отношения"))
-    kb.add(KeyboardButton("💼 Работа"))
-    kb.add(KeyboardButton("💰 Деньги"))
-    kb.add(KeyboardButton("🌌 Общий расклад"))
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(types.KeyboardButton("❤️ Отношения"),
+           types.KeyboardButton("💼 Работа"),
+           types.KeyboardButton("💰 Финансы"))
     return kb
 
-# ------------------------------------------------------------
-# Работа с картами
-# ------------------------------------------------------------
-def draw_cards(n: int = 3) -> List[Dict]:
-    cards = random.sample(DECK, n)
-    for c in cards:
-        c["reversed"] = random.choice([True, False])
-    return cards
+def spreads_kb():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(types.KeyboardButton("🔮 3 карты"),
+           types.KeyboardButton("🌟 5 карт"),
+           types.KeyboardButton("✨ Кельтский крест"))
+    return kb
 
-def interpret_card(card: Dict) -> str:
-    name = card["name"]
-    meaning = card["meaning_rev"] if card.get("reversed") else card["meaning_up"]
-    orientation = "перевёрнутая" if card.get("reversed") else "прямая"
-    return f"<b>{name}</b> ({orientation}): {meaning}"
+# === Хранилище состояния пользователей ===
+user_state = {}
 
-# ------------------------------------------------------------
-# Глубокая интерпретация расклада
-# ------------------------------------------------------------
-def summarize_spread(cards: List[Dict], theme: str = "Общий") -> str:
-    majors = [c for c in cards if c.get("arcana") == "major"]
-    reversed_cards = [c for c in cards if c.get("reversed")]
-    suits = [c.get("suit") for c in cards if c.get("suit")]
+# === Итоговые шаблоны ===
+SUMMARY_TEMPLATES = [
+    "✨ Итог расклада:\nТема: *{theme}*\nЗапрос: _{situation}_\n\n"
+    "Карты указывают, что судьба открывает перед вами новые возможности. Главное — слушать свою интуицию и не спешить с решениями.",
 
-    text_parts = []
+    "🌟 Заключение:\nВы выбрали тему *{theme}*, описали её так: _{situation}_.\n\n"
+    "Расклад советует обратить внимание на внутреннюю гармонию. В ближайшее время обстоятельства будут складываться в вашу пользу, если действовать осознанно.",
 
-    # Вступление
-    if len(majors) >= 2:
-        text_parts.append(
-            "✨ Перед вами период судьбоносных перемен — старшие арканы указывают, "
-            "что события будут иметь длительное влияние на вашу жизнь."
-        )
-    else:
-        text_parts.append(
-            "Карты отражают текущие процессы и внутренние переживания, "
-            "дают подсказки для ближайших шагов."
-        )
+    "🔮 Совет карт:\nВаш запрос: _{situation}_ (сфера: *{theme}*).\n\n"
+    "Карты говорят о переменах и возможностях для роста. Итог — держите сердце и разум открытыми, тогда вы получите больше, чем ожидаете.",
 
-    # Прямые / перевёрнутые
-    if reversed_cards:
-        text_parts.append(
-            "Перевёрнутые карты показывают наличие сомнений, внутренних блоков "
-            "или задержек в развитии ситуации."
-        )
-    else:
-        text_parts.append("Все карты выпали прямыми — это усиливает позитивный характер расклада.")
+    "🌌 Послание расклада:\nТема *{theme}* связана с вашим вопросом: _{situation}_.\n\n"
+    "Карты показывают, что сейчас важно сделать паузу, переосмыслить происходящее и довериться процессу. Время работает на вас."
+]
 
-    # По масти
-    if suits:
-        dominant = max(set(suits), key=suits.count)
-        if dominant == "cups":
-            text_parts.append(
-                "Доминируют Кубки — это сфера эмоций и отношений. "
-                "Главное сейчас — слушать сердце и быть искренним."
-            )
-        elif dominant == "swords":
-            text_parts.append(
-                "Много Мечей в раскладе — период интеллектуального напряжения, "
-                "анализа и возможных конфликтов."
-            )
-        elif dominant == "pentacles":
-            text_parts.append(
-                "Пентакли преобладают — акцент на материальной стороне жизни, "
-                "финансах и стабильности."
-            )
-        elif dominant == "wands":
-            text_parts.append(
-                "Жезлы ведут расклад — время для действий, смелых решений и инициативы."
-            )
-
-    # Тема
-    if theme == "Отношения":
-        text_parts.append(
-            "Тема расклада — отношения. Здесь проявляются вопросы доверия, "
-            "чувств и выбора между сердцем и разумом."
-        )
-    elif theme == "Работа":
-        text_parts.append(
-            "Тема расклада — работа. Карты указывают на карьерные перемены, "
-            "возможности роста и важность проявления инициативы."
-        )
-    elif theme == "Деньги":
-        text_parts.append(
-            "Тема расклада — финансы. Важен баланс между расходами и накоплениями, "
-            "а также умение вовремя использовать шансы."
-        )
-    else:
-        text_parts.append(
-            "Общий расклад показывает ваш личный путь, внутренние уроки "
-            "и стремление к гармонии."
-        )
-
-    # Заключение
-    text_parts.append(
-        "Карты дают направление, но выбор всегда остаётся за вами. "
-        "Используйте подсказки мудро, чтобы извлечь максимум пользы."
-    )
-
-    return "\n\n".join(text_parts)
-
-# ------------------------------------------------------------
-# Хэндлеры
-# ------------------------------------------------------------
+# === Обработчики ===
 @dp.message_handler(commands=["start"])
 async def cmd_start(m: types.Message):
-    await m.answer(
-        "Привет! Это бот раскладов на Таро 🎴\n\n"
-        "Выберите тему для расклада:",
-        reply_markup=menu_kb(),
-    )
+    user_state[m.from_user.id] = {}
+    await m.answer("Привет! Я Таро-бот 🎴\nВыберите сферу для расклада:", reply_markup=menu_kb())
 
 @dp.message_handler(commands=["menu"])
 async def cmd_menu(m: types.Message):
-    await m.answer("Выберите тему расклада:", reply_markup=menu_kb())
+    user_state[m.from_user.id] = {}
+    await m.answer("Выберите сферу для расклада:", reply_markup=menu_kb())
 
-@dp.message_handler(lambda m: m.text in ["🔮 Отношения", "💼 Работа", "💰 Деньги", "🌌 Общий расклад"])
-async def cmd_spread(m: types.Message):
-    theme_map = {
-        "🔮 Отношения": "Отношения",
-        "💼 Работа": "Работа",
-        "💰 Деньги": "Деньги",
-        "🌌 Общий расклад": "Общий",
-    }
-    theme = theme_map.get(m.text, "Общий")
-    cards = draw_cards(3)
+@dp.message_handler(lambda m: m.text in ["❤️ Отношения", "💼 Работа", "💰 Финансы"])
+async def choose_theme(m: types.Message):
+    user_state[m.from_user.id] = {"theme": m.text}
+    await m.answer(
+        "✍️ Опишите, пожалуйста, вашу ситуацию своими словами.\n"
+        "Например: 'Мы с Сергеем поссорились и я хочу понять, есть ли будущее' или 'Стоит ли менять работу'."
+    )
 
-    # Карточки
-    card_texts = [interpret_card(c) for c in cards]
-    spread_text = "\n\n".join(card_texts)
+@dp.message_handler(lambda m: m.from_user.id in user_state and "theme" in user_state[m.from_user.id] and "situation" not in user_state[m.from_user.id])
+async def save_situation(m: types.Message):
+    user_state[m.from_user.id]["situation"] = m.text
+    await m.answer("Спасибо 🙏 Теперь выберите расклад:", reply_markup=spreads_kb())
 
-    # Итог
-    summary = summarize_spread(cards, theme)
+@dp.message_handler(lambda m: m.text in ["🔮 3 карты", "🌟 5 карт", "✨ Кельтский крест"])
+async def do_spread(m: types.Message):
+    user = user_state.get(m.from_user.id, {})
+    theme = user.get("theme", "Общее")
+    situation = user.get("situation", "Без описания")
 
-    await m.answer(f"Ваш расклад ({theme}):\n\n{spread_text}\n\n{summary}")
+    num_cards = 3 if "3" in m.text else (5 if "5" in m.text else 10)
+    drawn_cards = random.sample(TAROT_DECK, num_cards)
+
+    interpretation = []
+    for card in drawn_cards:
+        if isinstance(card.get("meanings"), list):
+            meaning = random.choice(card["meanings"])
+        else:
+            meaning = card.get("meaning", "Смысл не найден")
+        interpretation.append(f"🃏 {card['name']} — {meaning}")
+
+    summary_template = random.choice(SUMMARY_TEMPLATES)
+    summary = summary_template.format(theme=theme, situation=situation)
+
+    await m.answer(
+        f"Ваш расклад ({m.text}):\n\n" + "\n\n".join(interpretation) + "\n\n" + summary,
+        parse_mode="Markdown",
+        reply_markup=menu_kb()
+    )
 
 @dp.message_handler()
-async def on_free_text(m: types.Message):
-    await m.answer("Выберите расклад через /menu.", reply_markup=menu_kb())
+async def fallback(m: types.Message):
+    await m.answer("Пожалуйста, выберите тему через /menu или кнопки ниже.", reply_markup=menu_kb())
 
-# ------------------------------------------------------------
-# Webhook handler
-# ------------------------------------------------------------
-async def webhook_handler(request: web.Request):
+# === Aiohttp сервер для вебхука ===
+async def webhook_handler(request):
     try:
         data = await request.json()
     except Exception:
-        return web.Response()
+        return web.Response(status=400)
     update = types.Update.to_object(data)
-    Bot.set_current(bot)
-    Dispatcher.set_current(dp)
     await dp.process_update(update)
-    return web.Response()
+    return web.Response(text="ok")
 
-# ------------------------------------------------------------
-# Запуск приложения
-# ------------------------------------------------------------
+async def on_startup(app):
+    webhook_url = os.getenv("RENDER_EXTERNAL_URL") + WEBHOOK_PATH
+    try:
+        await bot.set_webhook(webhook_url)
+        logger.info(f"Webhook успешно установлен: {webhook_url}")
+    except Exception as e:
+        logger.error(f"Ошибка при установке webhook: {e}")
+
+async def on_shutdown(app):
+    logger.info("Удаляем webhook...")
+    await bot.delete_webhook()
+
 def main():
     app = web.Application()
-    app.router.add_post("/webhook", webhook_handler)
-
-    async def on_startup(app_):
-        if not RENDER_EXTERNAL_URL:
-            log.warning("RENDER_EXTERNAL_URL не задан")
-            return
-        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-        try:
-            await bot.set_webhook(webhook_url)
-            log.info("Webhook установлен: %s", webhook_url)
-        except Exception as e:
-            log.error("Ошибка при установке webhook: %s", e)
-
+    app.router.add_post(WEBHOOK_PATH, webhook_handler)
     app.on_startup.append(on_startup)
-
-    port = int(os.getenv("PORT", 5000))
-    web.run_app(app, host="0.0.0.0", port=port, print=None)
+    app.on_shutdown.append(on_shutdown)
+    web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)
 
 if __name__ == "__main__":
     main()
