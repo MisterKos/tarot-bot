@@ -3,7 +3,6 @@ import json
 import logging
 import random
 import time
-import urllib.parse
 from collections import defaultdict, deque
 from typing import Dict, Any, List, Optional
 
@@ -29,6 +28,7 @@ DECK: Dict[str, Any] = {}
 CARDS: List[Dict[str, Any]] = []
 REVERSALS_PCT = 0
 IMAGE_BASE_URL: Optional[str] = None
+
 
 def _load_deck() -> None:
     global DECK, CARDS, REVERSALS_PCT, IMAGE_BASE_URL
@@ -59,6 +59,7 @@ def _load_deck() -> None:
     DECK, CARDS, REVERSALS_PCT, IMAGE_BASE_URL = {}, [], 0, None
     log.error("Колода не загружена — работаю с пустой.")
 
+
 _load_deck()
 
 # -------------------- инициализация бота и веб-сервера --------------------
@@ -66,20 +67,21 @@ bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher(bot)
 app = web.Application()
 
+
 async def handle_root(request):
     return web.Response(status=404, text="Not Found")
 
+
 async def handle_health(request):
     return web.Response(status=200, text="OK")
+
 
 app.router.add_get("/", handle_root)
 app.router.add_get("/healthz", handle_health)
 app.router.add_head("/", handle_root)
 
-# Webhook endpoint
+# Webhook endpoint (без токена в URL!)
 async def webhook_handler(request):
-    if request.match_info.get("token") != BOT_TOKEN:
-        return web.Response(status=403, text="forbidden")
     try:
         data = await request.json()
     except Exception:
@@ -88,7 +90,8 @@ async def webhook_handler(request):
     await dp.process_update(update)
     return web.Response(status=200, text="ok")
 
-app.router.add_post(f"/webhook/{{token}}", webhook_handler)
+
+app.router.add_post("/webhook", webhook_handler)
 
 # -------------------- состояния --------------------
 WAIT_TOPIC: Dict[int, Dict[str, Any]] = {}
@@ -115,9 +118,11 @@ def pick_cards(n: int) -> List[Dict[str, Any]]:
         })
     return result
 
+
 def card_title(c: Dict[str, Any]) -> str:
     t = c.get("title_ru") or c.get("title_en") or c.get("code") or "Карта"
     return f"{t}{' (перевёрнутая)' if c.get('reversed_flag') else ''}"
+
 
 def card_image_url(c: Dict[str, Any]) -> Optional[str]:
     img = c.get("image")
@@ -127,8 +132,10 @@ def card_image_url(c: Dict[str, Any]) -> Optional[str]:
         return IMAGE_BASE_URL.rstrip("/") + "/" + img
     return None
 
+
 def spread_positions(spread: str) -> List[str]:
     return ["Совет"] if spread == "1" else ["Прошлое", "Настоящее", "Будущее"]
+
 
 def summarize_spread(cards: List[Dict[str, Any]], spread: str, topic: str, question: str) -> str:
     if not cards:
@@ -168,6 +175,7 @@ def summarize_spread(cards: List[Dict[str, Any]], spread: str, topic: str, quest
     lines.append("\n🔮 Помните: карты показывают тенденции, но выбор остаётся за вами.")
     return "\n".join(lines)
 
+
 def format_spread_text(spread: str, cards: List[Dict[str, Any]]) -> str:
     pos = spread_positions(spread)
     chunks = []
@@ -177,11 +185,13 @@ def format_spread_text(spread: str, cards: List[Dict[str, Any]]) -> str:
         chunks.append(f"<b>{pos[i]}:</b> {title}\n<i>{meaning}</i>")
     return "\n\n".join(chunks)
 
+
 def menu_kb() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(KeyboardButton("🔮 1 карта — совет"), KeyboardButton("🔮 3 карты — П/Н/Б"))
     kb.row(KeyboardButton("🧾 История"), KeyboardButton("❌ Отмена"))
     return kb
+
 
 def topics_kb() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
@@ -190,6 +200,7 @@ def topics_kb() -> ReplyKeyboardMarkup:
     kb.row(KeyboardButton("❌ Отмена"))
     return kb
 
+
 def check_cooldown(user_id: int) -> Optional[int]:
     last = LAST_USED_AT.get(user_id)
     if not last:
@@ -197,21 +208,26 @@ def check_cooldown(user_id: int) -> Optional[int]:
     remain = COOLDOWN_SECONDS - int(time.time() - last)
     return remain if remain > 0 else None
 
+
 def mark_used(user_id: int):
     LAST_USED_AT[user_id] = time.time()
+
 
 # -------------------- хендлеры --------------------
 @dp.message_handler(commands=["start"])
 async def cmd_start(m: types.Message):
     await m.answer("Привет! Это бот раскладов на Таро 🎴", reply_markup=menu_kb())
 
+
 @dp.message_handler(commands=["menu"])
 async def cmd_menu(m: types.Message):
     await m.answer("Выберите расклад:", reply_markup=menu_kb())
 
+
 @dp.message_handler(commands=["ping"])
 async def cmd_ping(m: types.Message):
     await m.answer("pong")
+
 
 @dp.message_handler(commands=["history"])
 async def cmd_history(m: types.Message):
@@ -224,6 +240,7 @@ async def cmd_history(m: types.Message):
         lines.append(f"• {when} — {it['topic']} — «{it['question'] or 'без вопроса'}»")
     await m.answer("\n".join(lines))
 
+
 @dp.message_handler(lambda m: m.text in {"🔮 1 карта — совет", "🔮 3 карты — П/Н/Б"})
 async def on_pick_spread(m: types.Message):
     remain = check_cooldown(m.from_user.id)
@@ -233,6 +250,7 @@ async def on_pick_spread(m: types.Message):
     WAIT_TOPIC[m.from_user.id] = {"spread": spread}
     await m.answer("Выберите тему:", reply_markup=topics_kb())
 
+
 @dp.message_handler(lambda m: m.text in {"Отношения", "Работа", "Деньги", "Общее"})
 async def on_pick_topic(m: types.Message):
     state = WAIT_TOPIC.pop(m.from_user.id, None)
@@ -241,11 +259,13 @@ async def on_pick_topic(m: types.Message):
     WAIT_QUESTION[m.from_user.id] = {"spread": state["spread"], "topic": m.text}
     await m.answer("Сформулируйте ваш вопрос.", reply_markup=ReplyKeyboardMarkup(resize_keyboard=True).add(KeyboardButton("❌ Отмена")))
 
+
 @dp.message_handler(lambda m: m.text == "❌ Отмена")
 async def on_cancel(m: types.Message):
     WAIT_TOPIC.pop(m.from_user.id, None)
     WAIT_QUESTION.pop(m.from_user.id, None)
     await m.answer("Отменено.", reply_markup=menu_kb())
+
 
 @dp.message_handler()
 async def on_free_text(m: types.Message):
@@ -288,23 +308,25 @@ async def on_free_text(m: types.Message):
         return
     await m.answer("Выберите расклад через /menu.", reply_markup=menu_kb())
 
+
 # -------------------- запуск webhook-сервера --------------------
 async def on_startup(app_: web.Application):
     if not RENDER_EXTERNAL_URL:
         log.warning("RENDER_EXTERNAL_URL не задан — webhook не будет установлен.")
         return
-    token_encoded = urllib.parse.quote(BOT_TOKEN, safe="")
-    webhook_path = f"/webhook/{BOT_TOKEN}"   # локальный путь
-    full_url = f"https://{RENDER_EXTERNAL_URL}{webhook_path}".replace(BOT_TOKEN, token_encoded)
+
+    full_url = f"https://{RENDER_EXTERNAL_URL}/webhook"
     try:
         await bot.set_webhook(full_url)
         log.info("Webhook установлен: %s", full_url)
     except Exception as e:
         log.error("Ошибка при установке webhook: %s", e)
 
+
 def main():
     port = int(os.getenv("PORT", "10000"))
     web.run_app(app, host="0.0.0.0", port=port, print=None)
+
 
 if __name__ == "__main__":
     app.on_startup.append(on_startup)
