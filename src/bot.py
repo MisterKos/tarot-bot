@@ -20,7 +20,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
 
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")  # только домен!
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "300"))
 
 # Загрузка колоды
@@ -315,10 +315,13 @@ async def on_startup(app_: web.Application):
         return
 
     webhook_path = f"/webhook/{BOT_TOKEN}"
-    full_url = f"{RENDER_EXTERNAL_URL}{webhook_path}"
+    full_url = f"https://{RENDER_EXTERNAL_URL}{webhook_path}"
 
-    await bot.set_webhook(full_url)
-    log.info("Webhook установлен: %s", full_url)
+    try:
+        await bot.set_webhook(full_url)
+        log.info("Webhook установлен: %s", full_url)
+    except Exception as e:
+        log.error("Ошибка при установке webhook: %s", e)
 
 def main():
     port = int(os.getenv("PORT", "10000"))
