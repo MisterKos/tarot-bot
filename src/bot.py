@@ -3,6 +3,7 @@ import json
 import logging
 import random
 import time
+import urllib.parse
 from collections import defaultdict, deque
 from typing import Dict, Any, List, Optional
 
@@ -20,10 +21,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
 
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")  # только домен!
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "300"))
 
-# Загрузка колоды
 DECK_URL = os.getenv("DECK_URL", "").strip()
 DECK: Dict[str, Any] = {}
 CARDS: List[Dict[str, Any]] = []
@@ -64,7 +64,6 @@ _load_deck()
 # -------------------- инициализация бота и веб-сервера --------------------
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher(bot)
-
 app = web.Application()
 
 async def handle_root(request):
@@ -134,17 +133,14 @@ def spread_positions(spread: str) -> List[str]:
 def summarize_spread(cards: List[Dict[str, Any]], spread: str, topic: str, question: str) -> str:
     if not cards:
         return "Итог: колода недоступна."
-
     majors = sum(1 for c in cards if (c.get("code") or "").startswith("major_"))
     reversed_cnt = sum(1 for c in cards if c.get("reversed_flag"))
-
     suits = {"cups": 0, "swords": 0, "wands": 0, "pentacles": 0}
     for c in cards:
         code = (c.get("code") or "")
         for s in suits:
             if s in code:
                 suits[s] += 1
-
     suit_hint = max(suits, key=suits.get)
     suit_text_map = {
         "cups": "эмоции, чувства и отношения",
@@ -153,34 +149,23 @@ def summarize_spread(cards: List[Dict[str, Any]], spread: str, topic: str, quest
         "pentacles": "материальные вопросы, работа и стабильность",
     }
     suit_text = suit_text_map.get(suit_hint, "разные сферы жизни")
-
     lines = []
-
     if spread == "1":
-        lines.append("🌟 Карта-совет показывает главный ориентир в ситуации. "
-                     "Прислушайтесь к внутреннему ощущению «да или нет». "
-                     "Карты не дают готовых решений, они помогают увидеть суть.")
+        lines.append("🌟 Карта-совет показывает главный ориентир.")
     else:
         lines.append("🌟 Итог расклада:")
-
         if majors >= 2:
-            lines.append("Это важный переломный этап: ваши решения сейчас надолго повлияют на будущее.")
+            lines.append("Много старших арканов — период важных перемен.")
         elif majors == 1:
-            lines.append("Одна ключевая карта-аркан выделяет главную тему — именно она требует особого внимания.")
-
+            lines.append("Один старший аркан — есть ключевая тема.")
         if reversed_cnt >= 2:
-            lines.append("Много перевёрнутых карт указывают: внутренние сомнения и привычные реакции сейчас мешают движению вперёд.")
-
-        lines.append(f"Основная энергия расклада связана с темой: {suit_text}.")
-
+            lines.append("Много перевёрнутых карт — внутренние сомнения мешают.")
+        lines.append(f"Основная энергия расклада: {suit_text}.")
         if topic.lower() != "общее":
-            lines.append(f"Контекст, который вы выбрали: {topic}.")
+            lines.append(f"Контекст: {topic}.")
         if question:
-            lines.append(f"Ваш вопрос: «{question}»")
-
-    lines.append("\n🔮 Помните: карты отражают тенденции, но окончательные шаги всегда за вами. "
-                 "Любой выбор открывает новые пути и возможности.")
-
+            lines.append(f"Вопрос: «{question}»")
+    lines.append("\n🔮 Помните: карты показывают тенденции, но выбор остаётся за вами.")
     return "\n".join(lines)
 
 def format_spread_text(spread: str, cards: List[Dict[str, Any]]) -> str:
@@ -218,14 +203,15 @@ def mark_used(user_id: int):
 # -------------------- хендлеры --------------------
 @dp.message_handler(commands=["start"])
 async def cmd_start(m: types.Message):
-    await m.answer(
-        "Привет! Это бот раскладов на Таро 🎴\nВыберите расклад через /menu.",
-        reply_markup=menu_kb()
-    )
+    await m.answer("Привет! Это бот раскладов на Таро 🎴", reply_markup=menu_kb())
 
 @dp.message_handler(commands=["menu"])
 async def cmd_menu(m: types.Message):
     await m.answer("Выберите расклад:", reply_markup=menu_kb())
+
+@dp.message_handler(commands=["ping"])
+async def cmd_ping(m: types.Message):
+    await m.answer("pong")
 
 @dp.message_handler(commands=["history"])
 async def cmd_history(m: types.Message):
@@ -270,15 +256,12 @@ async def on_free_text(m: types.Message):
         if remain:
             WAIT_QUESTION[m.from_user.id] = qstate
             return await m.answer(f"Подождите ещё {remain} сек 🙏")
-
         n = 1 if spread == "1" else 3
         cards = pick_cards(n)
         if not cards:
             return await m.answer("Колода недоступна.")
-
         body = format_spread_text(spread, cards)
         summary = summarize_spread(cards, spread, topic, question)
-
         media_urls = [card_image_url(c) for c in cards if card_image_url(c)]
         if media_urls:
             media = [types.InputMediaPhoto(media=media_urls[0], caption=f"<b>Ваш расклад</b>\n\n{body}", parse_mode=ParseMode.HTML)]
@@ -291,9 +274,7 @@ async def on_free_text(m: types.Message):
                 await m.answer(f"<b>Ваш расклад</b>\n\n{body}")
         else:
             await m.answer(f"<b>Ваш расклад</b>\n\n{body}")
-
         await m.answer(summary, reply_markup=menu_kb())
-
         HISTORY[m.from_user.id].append({
             "ts": time.time(),
             "spread": spread,
@@ -303,7 +284,6 @@ async def on_free_text(m: types.Message):
         })
         mark_used(m.from_user.id)
         return
-
     if m.text.startswith("/"):
         return
     await m.answer("Выберите расклад через /menu.", reply_markup=menu_kb())
@@ -313,10 +293,9 @@ async def on_startup(app_: web.Application):
     if not RENDER_EXTERNAL_URL:
         log.warning("RENDER_EXTERNAL_URL не задан — webhook не будет установлен.")
         return
-
-    webhook_path = f"/webhook/{BOT_TOKEN}"
-    full_url = f"https://{RENDER_EXTERNAL_URL}{webhook_path}"
-
+    token_encoded = urllib.parse.quote(BOT_TOKEN, safe="")
+    webhook_path = f"/webhook/{BOT_TOKEN}"   # локальный путь
+    full_url = f"https://{RENDER_EXTERNAL_URL}{webhook_path}".replace(BOT_TOKEN, token_encoded)
     try:
         await bot.set_webhook(full_url)
         log.info("Webhook установлен: %s", full_url)
