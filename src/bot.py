@@ -1,148 +1,154 @@
 import json
 import logging
-import random
 import os
+import random
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiohttp import web
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.utils.executor import start_webhook
 
-API_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL")
+# ================== НАСТРОЙКИ ==================
+API_TOKEN = os.getenv("TELEGRAM_TOKEN")
+WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL")  # например https://tarot-bot-12u6.onrender.com
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 WEBAPP_HOST = "0.0.0.0"
-WEBAPP_PORT = int(os.getenv("PORT", 8080))
+WEBAPP_PORT = int(os.getenv("PORT", 5000))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tarot-bot")
 
-# --- Бот и диспетчер ---
 bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot)
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
 
-# --- Загружаем колоду ---
+# ================== СОСТОЯНИЯ ==================
+class TarotStates(StatesGroup):
+    waiting_for_topic = State()
+    waiting_for_situation = State()
+    waiting_for_spread = State()
+
+# ================== ЗАГРУЗКА КОЛОДЫ ==================
 with open("data/deck.json", "r", encoding="utf-8") as f:
-    DECK = json.load(f)
+    deck = json.load(f)
+cards = deck["cards"]
+IMAGE_BASE = deck["image_base_url"]
 
-CARDS = DECK["cards"]
-IMAGE_BASE = DECK["image_base_url"]
+# ================== ИСТОРИЯ ==================
+user_history = {}
 
-# --- Память для раскладов ---
-USER_STATE = {}
-HISTORY_FILE = "data/history.json"
+def save_history(user_id, spread):
+    if user_id not in user_history:
+        user_history[user_id] = []
+    user_history[user_id].insert(0, spread)
+    user_history[user_id] = user_history[user_id][:5]
 
-if os.path.exists(HISTORY_FILE):
-    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-        HISTORY = json.load(f)
-else:
-    HISTORY = {}
-
-def save_history():
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(HISTORY, f, ensure_ascii=False, indent=2)
-
-# --- Клавиатуры ---
-def main_menu():
+# ================== КНОПКИ ==================
+def topic_kb():
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("🔮 Отношения", "💼 Работа")
-    kb.add("💰 Финансы", "🌌 Общий расклад")
+    kb.add(KeyboardButton("🔮 Отношения"), KeyboardButton("💼 Работа"))
+    kb.add(KeyboardButton("💰 Финансы"), KeyboardButton("🌟 Общий расклад"))
     return kb
 
-def spread_menu():
+def spread_kb():
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("1 карта", "3 карты")
-    kb.add("Кельтский крест")
+    kb.add(KeyboardButton("1 карта"), KeyboardButton("3 карты"))
+    kb.add(KeyboardButton("Кельтский крест"))
     return kb
 
-# --- Выбор случайных карт ---
-def draw_cards(n=1):
-    cards = random.sample(CARDS, n)
+# ================== ГЕНЕРАЦИЯ КАРТ ==================
+def draw_cards(n):
     result = []
-    for card in cards:
-        is_reversed = random.randint(1, 100) <= DECK["reversals_percent"]
+    for _ in range(n):
+        card = random.choice(cards)
+        is_reversed = random.randint(1, 100) <= deck["reversals_percent"]
         result.append({
             "title": card["title_ru"],
+            "upright": card["upright"],
+            "reversed": card["reversed"],
             "image": IMAGE_BASE + card["image"],
-            "orientation": "Перевернутая" if is_reversed else "Прямая",
-            "meaning": card["reversed"] if is_reversed else card["upright"]
+            "is_reversed": is_reversed
         })
     return result
 
-# --- Формирование красивого текста ---
-def format_interpretation(theme, situation, spread_type, cards):
-    text = f"✨ *Расклад по теме:* {theme}\n"
-    text += f"📝 *Вопрос:* {situation}\n"
-    text += f"🔮 *Тип расклада:* {spread_type}\n\n"
-    for i, card in enumerate(cards, 1):
-        text += f"**Карта {i}: {card['title']} ({card['orientation']})**\n"
-        text += f"Толкование: {card['meaning']}\n\n"
-    text += "🌟 *Итоговое толкование:* 🌟\n"
-    text += (
-        "Карты показали глубокую картину ситуации. "
-        "Внимательно отнеситесь к их подсказкам: они открывают "
-        "возможности для роста, перемен и осознания. "
-        "Доверяйте своей интуиции и помните — выбор всегда за вами."
-    )
+def interpret_cards(cards_drawn, situation, topic, spread_type):
+    text = f"✨ Расклад по теме *{topic}* ({spread_type}) ✨\n\n"
+    positions = ["Прошлое", "Настоящее", "Будущее"]
+
+    for i, card in enumerate(cards_drawn):
+        pos = positions[i] if spread_type == "3 карты" else f"Карта {i+1}"
+        orientation = "Перевёрнутая" if card["is_reversed"] else "Прямая"
+        meaning = card["reversed"] if card["is_reversed"] else card["upright"]
+
+        text += f"🔹 *{pos}:* {card['title']} ({orientation})\n{meaning}\n\n"
+
+    text += f"🌙 *Итог:* В контексте вашей ситуации ({situation}), карты показывают общий совет: доверяйте процессу, ищите баланс и будьте открыты к переменам."
     return text
 
-# --- Обработчики ---
+# ================== ХЕНДЛЕРЫ ==================
 @dp.message_handler(commands=["start"])
-async def cmd_start(message: types.Message):
-    await message.answer(
-        "Привет! Я виртуальный таролог 🧙‍♂️\n"
-        "Выбери тему расклада:", reply_markup=main_menu()
-    )
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.finish()
+    await message.answer("Привет! Я виртуальный таролог. ✨\nВыберите тему расклада:", reply_markup=topic_kb())
+    await TarotStates.waiting_for_topic.set()
 
-@dp.message_handler(lambda m: m.text in ["🔮 Отношения", "💼 Работа", "💰 Финансы", "🌌 Общий расклад"])
-async def choose_theme(message: types.Message):
-    theme = message.text
-    USER_STATE[message.from_user.id] = {"theme": theme}
-    await message.answer(
-        f"✏️ Опиши, пожалуйста, свою ситуацию подробнее.", reply_markup=types.ReplyKeyboardRemove()
-    )
+@dp.message_handler(lambda m: m.text in ["🔮 Отношения", "💼 Работа", "💰 Финансы", "🌟 Общий расклад"], state=TarotStates.waiting_for_topic)
+async def choose_topic(message: types.Message, state: FSMContext):
+    topic = message.text.replace("🔮 ", "").replace("💼 ", "").replace("💰 ", "").replace("🌟 ", "")
+    await state.update_data(topic=topic)
+    await message.answer(f"📝 Опишите, пожалуйста, вашу ситуацию по теме *{topic}*.", reply_markup=types.ReplyKeyboardRemove())
+    await TarotStates.waiting_for_situation.set()
 
-@dp.message_handler(lambda m: m.from_user.id in USER_STATE and "theme" in USER_STATE[m.from_user.id] and "situation" not in USER_STATE[m.from_user.id])
-async def choose_situation(message: types.Message):
-    USER_STATE[message.from_user.id]["situation"] = message.text
-    await message.answer("Выбери тип расклада:", reply_markup=spread_menu())
+@dp.message_handler(state=TarotStates.waiting_for_situation)
+async def describe_situation(message: types.Message, state: FSMContext):
+    await state.update_data(situation=message.text)
+    await message.answer("Выберите тип расклада:", reply_markup=spread_kb())
+    await TarotStates.waiting_for_spread.set()
 
-@dp.message_handler(lambda m: m.text in ["1 карта", "3 карты", "Кельтский крест"])
-async def make_spread(message: types.Message):
-    uid = str(message.from_user.id)
-    theme = USER_STATE[message.from_user.id]["theme"]
-    situation = USER_STATE[message.from_user.id]["situation"]
+@dp.message_handler(lambda m: m.text in ["1 карта", "3 карты", "Кельтский крест"], state=TarotStates.waiting_for_spread)
+async def make_spread(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    topic, situation = data["topic"], data["situation"]
     spread_type = message.text
 
-    n = 1 if spread_type == "1 карта" else 3 if spread_type == "3 карты" else 10
-    cards = draw_cards(n)
+    if spread_type == "1 карта":
+        n = 1
+    elif spread_type == "3 карты":
+        n = 3
+    else:
+        n = 10
 
-    # Сохраняем историю
-    entry = {"theme": theme, "situation": situation, "spread": spread_type, "cards": cards}
-    HISTORY.setdefault(uid, []).append(entry)
-    HISTORY[uid] = HISTORY[uid][-5:]
-    save_history()
+    drawn = draw_cards(n)
+    interpretation = interpret_cards(drawn, situation, topic, spread_type)
 
     # Отправляем карты
-    for i, card in enumerate(cards, 1):
-        caption = f"Карта {i}: {card['title']} ({card['orientation']})"
-        await message.answer_photo(card["image"], caption=caption)
+    media = [types.InputMediaPhoto(card["image"], caption=f"{card['title']} ({'перевёрнутая' if card['is_reversed'] else 'прямая'})") if i == 0 else types.InputMediaPhoto(card["image"]) for i, card in enumerate(drawn)]
+    await message.answer_media_group(media)
 
-    # Отправляем интерпретацию
-    interpretation = format_interpretation(theme, situation, spread_type, cards)
+    # Отправляем текст
     await message.answer(interpretation, parse_mode="Markdown")
 
-# --- Webhook ---
-async def webhook_handler(request):
-    data = await request.json()
-    update = types.Update.to_object(data)
-    await dp.process_update(update)
-    return web.Response()
+    save_history(message.from_user.id, {"topic": topic, "situation": situation, "spread": spread_type, "cards": drawn})
 
-def main():
-    app = web.Application()
-    app.router.add_post(WEBHOOK_PATH, webhook_handler)
+    await state.finish()
+
+# ================== ВЕБХУК ==================
+async def on_startup(dp):
+    await bot.set_webhook(WEBHOOK_URL)
     logger.info(f"Webhook установлен: {WEBHOOK_URL}")
-    web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)
+
+async def on_shutdown(dp):
+    await bot.delete_webhook()
 
 if __name__ == "__main__":
-    main()
+    start_webhook(
+        dispatcher=dp,
+        webhook_path=WEBHOOK_PATH,
+        skip_updates=True,
+        on_startup=on_startup,
+        on_shutdown=on_shutdown,
+        host=WEBAPP_HOST,
+        port=WEBAPP_PORT,
+    )
