@@ -4,7 +4,9 @@ import json
 import random
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils.executor import start_webhook
-from aiohttp import web
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
 
 # --- Логирование ---
 logging.basicConfig(level=logging.INFO)
@@ -18,11 +20,16 @@ WEBAPP_PORT = int(os.getenv("PORT", 5000))
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 WEBHOOK_URL = f"{RENDER_URL}{WEBHOOK_PATH}"
 
+# --- FSM для ожидания ситуации ---
+class Form(StatesGroup):
+    waiting_for_situation = State()
+
 # --- Инициализация ---
 bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot)
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
 
-# фиксируем контекст для webhook-режима
+# фиксируем контекст
 Bot.set_current(bot)
 Dispatcher.set_current(dp)
 
@@ -47,7 +54,6 @@ def interpret_cards(cards, theme, situation):
     for i, card in enumerate(cards, 1):
         text += f"**{i}. {card['name']}** — {card['meaning']}\n\n"
 
-    # Итоговое толкование
     text += "🔮 *Итог расклада*\n"
     if theme == "Отношения":
         text += ("Карты показывают динамику ваших личных связей. "
@@ -79,39 +85,45 @@ async def cmd_start(message: types.Message):
     )
 
 @dp.message_handler(lambda m: m.text in ["🔮 Отношения", "💼 Работа", "💰 Финансы", "🌌 Общий расклад"])
-async def choose_theme(message: types.Message):
+async def choose_theme(message: types.Message, state: FSMContext):
     theme = message.text.replace("🔮 ", "").replace("💼 ", "").replace("💰 ", "").replace("🌌 ", "")
-    dp.current_state(user=message.from_user.id).set_state("await_situation")
-    await dp.current_state(user=message.from_user.id).update_data(theme=theme)
+    await state.update_data(theme=theme)
+    await Form.waiting_for_situation.set()
     await message.answer(f"Опишите, пожалуйста, вашу ситуацию по теме *{theme}*. "
                          "Это поможет сделать расклад более точным.")
 
-@dp.message_handler(state="await_situation")
-async def handle_situation(message: types.Message):
-    user_data = await dp.current_state(user=message.from_user.id).get_data()
+@dp.message_handler(state=Form.waiting_for_situation)
+async def handle_situation(message: types.Message, state: FSMContext):
+    user_data = await state.get_data()
     theme = user_data.get("theme", "Общий расклад")
     situation = message.text
     cards = draw_cards(3)
     text = interpret_cards(cards, theme, situation)
     await message.answer(text, parse_mode="Markdown", reply_markup=menu_kb())
-    await dp.current_state(user=message.from_user.id).reset_state()
+    await state.finish()
 
 # --- Webhook ---
-async def on_startup(app):
+async def on_startup(dp):
     if WEBHOOK_URL:
         await bot.set_webhook(WEBHOOK_URL)
         logger.info(f"Webhook установлен: {WEBHOOK_URL}")
     else:
         logger.warning("WEBHOOK_URL не задан!")
 
-async def on_shutdown(app):
+async def on_shutdown(dp):
     logger.info("Отключение...")
     await bot.delete_webhook()
 
 def main():
-    app = web.Application()
-    dp.register_app(app, path=WEBHOOK_PATH)
-    web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)
+    start_webhook(
+        dispatcher=dp,
+        webhook_path=WEBHOOK_PATH,
+        on_startup=on_startup,
+        on_shutdown=on_shutdown,
+        skip_updates=True,
+        host=WEBAPP_HOST,
+        port=WEBAPP_PORT,
+    )
 
 if __name__ == "__main__":
     main()
