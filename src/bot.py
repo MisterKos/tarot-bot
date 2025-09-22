@@ -8,7 +8,6 @@ from typing import Dict, Any, List, Optional
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
-from aiogram.utils.executor import set_webhook
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ParseMode
 
 import requests
@@ -280,7 +279,6 @@ async def on_free_text(m: types.Message):
         body = format_spread_text(spread, cards)
         summary = summarize_spread(cards, spread, topic, question)
 
-        # --- отправляем карты с картинками ---
         media_urls = [card_image_url(c) for c in cards if card_image_url(c)]
         if media_urls:
             media = [types.InputMediaPhoto(media=media_urls[0], caption=f"<b>Ваш расклад</b>\n\n{body}", parse_mode=ParseMode.HTML)]
@@ -294,7 +292,6 @@ async def on_free_text(m: types.Message):
         else:
             await m.answer(f"<b>Ваш расклад</b>\n\n{body}")
 
-        # --- отдельно интерпретация ---
         await m.answer(summary, reply_markup=menu_kb())
 
         HISTORY[m.from_user.id].append({
@@ -316,12 +313,12 @@ async def on_startup(app_: web.Application):
     if not RENDER_EXTERNAL_URL:
         log.warning("RENDER_EXTERNAL_URL не задан — webhook не будет установлен.")
         return
-    url = f"{RENDER_EXTERNAL_URL}/webhook/{BOT_TOKEN}"
-    ok = await set_webhook(dp, url)   # исправлено: передаём dp
-    if ok:
-        log.info("Webhook установлен: %s", url)
-    else:
-        log.error("Не удалось установить webhook: %s", url)
+
+    webhook_path = f"/webhook/{BOT_TOKEN}"
+    full_url = f"{RENDER_EXTERNAL_URL}{webhook_path}"
+
+    await bot.set_webhook(full_url)
+    log.info("Webhook установлен: %s", full_url)
 
 def main():
     port = int(os.getenv("PORT", "10000"))
