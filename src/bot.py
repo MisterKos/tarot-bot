@@ -8,7 +8,11 @@ from typing import Dict, Any, List, Optional
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ParseMode
+from aiogram.utils.executor import set_webhook
+from aiogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, ParseMode
+)
 
 import requests
 
@@ -20,15 +24,15 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
 
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "300"))
 
+# Загрузка колоды: сначала локально data/deck.json, потом по DECK_URL
 DECK_URL = os.getenv("DECK_URL", "").strip()
 DECK: Dict[str, Any] = {}
 CARDS: List[Dict[str, Any]] = []
 REVERSALS_PCT = 0
 IMAGE_BASE_URL: Optional[str] = None
-
 
 def _load_deck() -> None:
     global DECK, CARDS, REVERSALS_PCT, IMAGE_BASE_URL
@@ -54,42 +58,47 @@ def _load_deck() -> None:
             log.info("Колода загружена по URL: %s", DECK_URL)
             return
         except Exception as e:
-            log.error("Фатально: не удалось загрузить колоду: %s", e)
+            log.error("Фатально: не удалось загрузить колоду ни локально, ни по URL: %s", e)
 
-    DECK, CARDS, REVERSALS_PCT, IMAGE_BASE_URL = {}, [], 0, None
-    log.error("Колода не загружена — работаю с пустой.")
-
+    DECK = {}
+    CARDS = []
+    REVERSALS_PCT = 0
+    IMAGE_BASE_URL = None
+    log.error("Колода не загружена ни локально, ни по URL — работаю с пустой.")
 
 _load_deck()
 
 # -------------------- инициализация бота и веб-сервера --------------------
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+Bot.set_current(bot)   # фикс для aiogram контекста
 dp = Dispatcher(bot)
+
 app = web.Application()
 
-
+# -------------------- корневые ручки --------------------
 async def handle_root(request):
     return web.Response(status=404, text="Not Found")
 
-
 async def handle_health(request):
     return web.Response(status=200, text="OK")
-
 
 app.router.add_get("/", handle_root)
 app.router.add_get("/healthz", handle_health)
 app.router.add_head("/", handle_root)
 
-# Webhook endpoint (без токена в URL)
+# -------------------- webhook --------------------
 async def webhook_handler(request):
     try:
         data = await request.json()
     except Exception:
         data = {}
-    update = types.Update.to_object(data)
-    await dp.process_update(update)
+    try:
+        update = types.Update(**data)  # правильное преобразование
+        await dp.process_update(update)
+    except Exception as e:
+        log.error("Ошибка при обработке апдейта: %s", e)
+        return web.Response(status=500, text="error")
     return web.Response(status=200, text="ok")
-
 
 app.router.add_post("/webhook", webhook_handler)
 
@@ -99,7 +108,7 @@ WAIT_QUESTION: Dict[int, Dict[str, Any]] = {}
 HISTORY: Dict[int, deque] = defaultdict(lambda: deque(maxlen=10))
 LAST_USED_AT: Dict[int, float] = {}
 
-# -------------------- утилиты --------------------
+# -------------------- утилиты раскладов --------------------
 def pick_cards(n: int) -> List[Dict[str, Any]]:
     if not CARDS or len(CARDS) < n:
         return []
@@ -109,72 +118,79 @@ def pick_cards(n: int) -> List[Dict[str, Any]]:
         is_reversed = random.randint(1, 100) <= max(0, min(100, REVERSALS_PCT))
         result.append({
             "code": c.get("code"),
-            "title_ru": c.get("title_ru"),
             "title_en": c.get("title_en"),
+            "title_ru": c.get("title_ru"),
+            "image": c.get("image"),
             "upright": c.get("upright"),
             "reversed": c.get("reversed"),
-            "image": c.get("image"),
             "reversed_flag": is_reversed,
         })
     return result
-
 
 def card_title(c: Dict[str, Any]) -> str:
     t = c.get("title_ru") or c.get("title_en") or c.get("code") or "Карта"
     return f"{t}{' (перевёрнутая)' if c.get('reversed_flag') else ''}"
 
-
 def card_image_url(c: Dict[str, Any]) -> Optional[str]:
     img = c.get("image")
     if not img:
         return None
-    if IMAGE_BASE_URL and IMAGE_BASE_URL.startswith("http"):
+    if IMAGE_BASE_URL and isinstance(IMAGE_BASE_URL, str) and IMAGE_BASE_URL.startswith("http"):
         return IMAGE_BASE_URL.rstrip("/") + "/" + img
     return None
 
-
 def spread_positions(spread: str) -> List[str]:
-    return ["Совет"] if spread == "1" else ["Прошлое", "Настоящее", "Будущее"]
-
+    if spread == "1":
+        return ["Совет"]
+    return ["Прошлое", "Настоящее", "Будущее"]
 
 def summarize_spread(cards: List[Dict[str, Any]], spread: str, topic: str, question: str) -> str:
     if not cards:
-        return "Итог: колода недоступна."
+        return "Итог: колода недоступна, расклад не выполнен."
+
     majors = sum(1 for c in cards if (c.get("code") or "").startswith("major_"))
     reversed_cnt = sum(1 for c in cards if c.get("reversed_flag"))
-    suits = {"cups": 0, "swords": 0, "wands": 0, "pentacles": 0}
+    suits = {"cups":0, "swords":0, "wands":0, "pentacles":0, "other":0}
     for c in cards:
         code = (c.get("code") or "")
-        for s in suits:
+        found = False
+        for s in ["cups", "swords", "wands", "pentacles"]:
             if s in code:
                 suits[s] += 1
-    suit_hint = max(suits, key=suits.get)
+                found = True
+                break
+        if not found and not code.startswith("major_"):
+            suits["other"] += 1
+
+    suit_hint = max(suits, key=suits.get) if cards else "other"
     suit_text_map = {
-        "cups": "эмоции, чувства и отношения",
-        "swords": "мысли, выбор и внутренние конфликты",
-        "wands": "энергия, действия и новые начинания",
-        "pentacles": "материальные вопросы, работа и стабильность",
+        "cups": "эмоции и отношения",
+        "swords": "мысли, выбор и напряжение",
+        "wands": "действия, энергия и инициативы",
+        "pentacles": "материальные вопросы и стабильность",
+        "other": "разнородные влияния",
     }
-    suit_text = suit_text_map.get(suit_hint, "разные сферы жизни")
+    suit_text = suit_text_map.get(suit_hint, "разнородные влияния")
+
     lines = []
     if spread == "1":
-        lines.append("🌟 Карта-совет показывает главный ориентир.")
+        lines.append("Итог: карта-совет акцентирует ключевой фокус. Прислушайтесь к себе, но решение остаётся за вами.")
     else:
-        lines.append("🌟 Итог расклада:")
+        lines.append("Итог расклада:")
         if majors >= 2:
-            lines.append("Много старших арканов — период важных перемен.")
+            lines.append("• Много старших арканов — сейчас время важных перемен.")
         elif majors == 1:
-            lines.append("Один старший аркан — есть ключевая тема.")
+            lines.append("• Один старший аркан — выделяется центральная тема.")
         if reversed_cnt >= 2:
-            lines.append("Много перевёрнутых карт — внутренние сомнения мешают.")
-        lines.append(f"Основная энергия расклада: {suit_text}.")
+            lines.append("• Много перевёрнутых карт — внутренние сомнения и блоки влияют сильнее внешних факторов.")
+        lines.append(f"• Преобладающая тема: {suit_text}.")
         if topic.lower() != "общее":
-            lines.append(f"Контекст: {topic}.")
+            lines.append(f"• Контекст: {topic}.")
         if question:
-            lines.append(f"Вопрос: «{question}»")
-    lines.append("\n🔮 Помните: карты показывают тенденции, но выбор остаётся за вами.")
-    return "\n".join(lines)
+            lines.append(f"• Вопрос: {question}")
+        lines.append("Помните: карты показывают тенденции, но выбор остаётся за вами.")
 
+    return "\n".join(lines)
 
 def format_spread_text(spread: str, cards: List[Dict[str, Any]]) -> str:
     pos = spread_positions(spread)
@@ -185,13 +201,12 @@ def format_spread_text(spread: str, cards: List[Dict[str, Any]]) -> str:
         chunks.append(f"<b>{pos[i]}:</b> {title}\n<i>{meaning}</i>")
     return "\n\n".join(chunks)
 
-
+# -------------------- клавиатуры --------------------
 def menu_kb() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(KeyboardButton("🔮 1 карта — совет"), KeyboardButton("🔮 3 карты — П/Н/Б"))
     kb.row(KeyboardButton("🧾 История"), KeyboardButton("❌ Отмена"))
     return kb
-
 
 def topics_kb() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
@@ -200,7 +215,7 @@ def topics_kb() -> ReplyKeyboardMarkup:
     kb.row(KeyboardButton("❌ Отмена"))
     return kb
 
-
+# -------------------- кулдаун --------------------
 def check_cooldown(user_id: int) -> Optional[int]:
     last = LAST_USED_AT.get(user_id)
     if not last:
@@ -208,26 +223,20 @@ def check_cooldown(user_id: int) -> Optional[int]:
     remain = COOLDOWN_SECONDS - int(time.time() - last)
     return remain if remain > 0 else None
 
-
 def mark_used(user_id: int):
     LAST_USED_AT[user_id] = time.time()
 
-
-# -------------------- хендлеры --------------------
+# -------------------- команды --------------------
 @dp.message_handler(commands=["start"])
 async def cmd_start(m: types.Message):
-    await m.answer("Привет! Это бот раскладов на Таро 🎴", reply_markup=menu_kb())
-
+    await m.answer(
+        "Привет! Это бот раскладов на Таро 🎴\nВыберите расклад через /menu.",
+        reply_markup=menu_kb()
+    )
 
 @dp.message_handler(commands=["menu"])
 async def cmd_menu(m: types.Message):
     await m.answer("Выберите расклад:", reply_markup=menu_kb())
-
-
-@dp.message_handler(commands=["ping"])
-async def cmd_ping(m: types.Message):
-    await m.answer("pong")
-
 
 @dp.message_handler(commands=["history"])
 async def cmd_history(m: types.Message):
@@ -237,10 +246,10 @@ async def cmd_history(m: types.Message):
     lines = ["<b>Последние расклады:</b>"]
     for it in reversed(items):
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(it["ts"]))
-        lines.append(f"• {when} — {it['topic']} — «{it['question'] or 'без вопроса'}»")
+        lines.append(f"• {when} — {('1 карта' if it['spread']=='1' else '3 карты')}: {it['topic']} — «{it['question'] or 'без вопроса'}»")
     await m.answer("\n".join(lines))
 
-
+# -------------------- кнопки --------------------
 @dp.message_handler(lambda m: m.text in {"🔮 1 карта — совет", "🔮 3 карты — П/Н/Б"})
 async def on_pick_spread(m: types.Message):
     remain = check_cooldown(m.from_user.id)
@@ -250,15 +259,13 @@ async def on_pick_spread(m: types.Message):
     WAIT_TOPIC[m.from_user.id] = {"spread": spread}
     await m.answer("Выберите тему:", reply_markup=topics_kb())
 
-
 @dp.message_handler(lambda m: m.text in {"Отношения", "Работа", "Деньги", "Общее"})
 async def on_pick_topic(m: types.Message):
     state = WAIT_TOPIC.pop(m.from_user.id, None)
     if not state:
-        return await m.answer("Сначала выберите расклад через /menu.")
+        return await m.answer("Сначала выберите расклад.")
     WAIT_QUESTION[m.from_user.id] = {"spread": state["spread"], "topic": m.text}
-    await m.answer("Сформулируйте ваш вопрос.", reply_markup=ReplyKeyboardMarkup(resize_keyboard=True).add(KeyboardButton("❌ Отмена")))
-
+    await m.answer("Сформулируйте вопрос.", reply_markup=ReplyKeyboardMarkup(resize_keyboard=True).add(KeyboardButton("❌ Отмена")))
 
 @dp.message_handler(lambda m: m.text == "❌ Отмена")
 async def on_cancel(m: types.Message):
@@ -266,12 +273,14 @@ async def on_cancel(m: types.Message):
     WAIT_QUESTION.pop(m.from_user.id, None)
     await m.answer("Отменено.", reply_markup=menu_kb())
 
-
+# -------------------- текст --------------------
 @dp.message_handler()
 async def on_free_text(m: types.Message):
     qstate = WAIT_QUESTION.pop(m.from_user.id, None)
     if qstate:
-        spread, topic, question = qstate["spread"], qstate["topic"], m.text.strip()
+        spread = qstate["spread"]
+        topic = qstate["topic"]
+        question = m.text.strip()
         remain = check_cooldown(m.from_user.id)
         if remain:
             WAIT_QUESTION[m.from_user.id] = qstate
@@ -279,7 +288,7 @@ async def on_free_text(m: types.Message):
         n = 1 if spread == "1" else 3
         cards = pick_cards(n)
         if not cards:
-            return await m.answer("Колода недоступна.")
+            return await m.answer("Колода недоступна.", reply_markup=menu_kb())
         body = format_spread_text(spread, cards)
         summary = summarize_spread(cards, spread, topic, question)
         media_urls = [card_image_url(c) for c in cards if card_image_url(c)]
@@ -290,7 +299,7 @@ async def on_free_text(m: types.Message):
             try:
                 await m.answer_media_group(media)
             except Exception as e:
-                log.warning("Не удалось отправить media group: %r — отправлю текстом", e)
+                log.warning("Media group error: %r", e)
                 await m.answer(f"<b>Ваш расклад</b>\n\n{body}")
         else:
             await m.answer(f"<b>Ваш расклад</b>\n\n{body}")
@@ -308,26 +317,24 @@ async def on_free_text(m: types.Message):
         return
     await m.answer("Выберите расклад через /menu.", reply_markup=menu_kb())
 
-
-# -------------------- запуск webhook-сервера --------------------
+# -------------------- запуск --------------------
 async def on_startup(app_: web.Application):
     if not RENDER_EXTERNAL_URL:
         log.warning("RENDER_EXTERNAL_URL не задан — webhook не будет установлен.")
         return
-
-    webhook_path = "/webhook"
-    full_url = f"https://{RENDER_EXTERNAL_URL}{webhook_path}"
+    url = f"https://{RENDER_EXTERNAL_URL}/webhook"
     try:
-        await bot.set_webhook(full_url)
-        log.info("Webhook установлен: %s", full_url)
+        ok = await set_webhook(dp, url)
+        if ok:
+            log.info("Webhook установлен: %s", url)
+        else:
+            log.error("Не удалось установить webhook: %s", url)
     except Exception as e:
         log.error("Ошибка при установке webhook: %s", e)
-
 
 def main():
     port = int(os.getenv("PORT", "10000"))
     web.run_app(app, host="0.0.0.0", port=port, print=None)
-
 
 if __name__ == "__main__":
     app.on_startup.append(on_startup)
