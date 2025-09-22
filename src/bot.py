@@ -8,12 +8,10 @@ from typing import Dict, Any, List, Optional
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
-from aiogram.utils.executor import set_webhook
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, ParseMode
 )
-
 import requests
 
 # -------------------- базовая конфигурация --------------------
@@ -24,10 +22,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
 
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "300"))
 
-# Загрузка колоды: сначала локально data/deck.json, потом по DECK_URL
+# Загрузка колоды
 DECK_URL = os.getenv("DECK_URL", "").strip()
 DECK: Dict[str, Any] = {}
 CARDS: List[Dict[str, Any]] = []
@@ -58,24 +56,24 @@ def _load_deck() -> None:
             log.info("Колода загружена по URL: %s", DECK_URL)
             return
         except Exception as e:
-            log.error("Фатально: не удалось загрузить колоду ни локально, ни по URL: %s", e)
+            log.error("Фатально: не удалось загрузить колоду: %s", e)
 
     DECK = {}
     CARDS = []
     REVERSALS_PCT = 0
     IMAGE_BASE_URL = None
-    log.error("Колода не загружена ни локально, ни по URL — работаю с пустой.")
+    log.error("Колода не загружена — работаю с пустой.")
 
 _load_deck()
 
 # -------------------- инициализация бота и веб-сервера --------------------
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
-Bot.set_current(bot)   # фикс для aiogram контекста
+Bot.set_current(bot)  # фикс для контекста
 dp = Dispatcher(bot)
 
 app = web.Application()
 
-# -------------------- корневые ручки --------------------
+# health-check
 async def handle_root(request):
     return web.Response(status=404, text="Not Found")
 
@@ -84,16 +82,15 @@ async def handle_health(request):
 
 app.router.add_get("/", handle_root)
 app.router.add_get("/healthz", handle_health)
-app.router.add_head("/", handle_root)
 
-# -------------------- webhook --------------------
+# webhook endpoint
 async def webhook_handler(request):
     try:
         data = await request.json()
     except Exception:
         data = {}
     try:
-        update = types.Update(**data)  # правильное преобразование
+        update = types.Update(**data)   # фикс вместо to_object
         await dp.process_update(update)
     except Exception as e:
         log.error("Ошибка при обработке апдейта: %s", e)
@@ -108,7 +105,7 @@ WAIT_QUESTION: Dict[int, Dict[str, Any]] = {}
 HISTORY: Dict[int, deque] = defaultdict(lambda: deque(maxlen=10))
 LAST_USED_AT: Dict[int, float] = {}
 
-# -------------------- утилиты раскладов --------------------
+# -------------------- утилиты --------------------
 def pick_cards(n: int) -> List[Dict[str, Any]]:
     if not CARDS or len(CARDS) < n:
         return []
@@ -135,7 +132,7 @@ def card_image_url(c: Dict[str, Any]) -> Optional[str]:
     img = c.get("image")
     if not img:
         return None
-    if IMAGE_BASE_URL and isinstance(IMAGE_BASE_URL, str) and IMAGE_BASE_URL.startswith("http"):
+    if IMAGE_BASE_URL and IMAGE_BASE_URL.startswith("http"):
         return IMAGE_BASE_URL.rstrip("/") + "/" + img
     return None
 
@@ -146,50 +143,48 @@ def spread_positions(spread: str) -> List[str]:
 
 def summarize_spread(cards: List[Dict[str, Any]], spread: str, topic: str, question: str) -> str:
     if not cards:
-        return "Итог: колода недоступна, расклад не выполнен."
+        return "Итог: колода недоступна."
 
     majors = sum(1 for c in cards if (c.get("code") or "").startswith("major_"))
     reversed_cnt = sum(1 for c in cards if c.get("reversed_flag"))
-    suits = {"cups":0, "swords":0, "wands":0, "pentacles":0, "other":0}
+    suits = {"cups":0,"swords":0,"wands":0,"pentacles":0,"other":0}
     for c in cards:
         code = (c.get("code") or "")
-        found = False
-        for s in ["cups", "swords", "wands", "pentacles"]:
-            if s in code:
-                suits[s] += 1
-                found = True
-                break
-        if not found and not code.startswith("major_"):
-            suits["other"] += 1
+        if "cups" in code: suits["cups"]+=1
+        elif "swords" in code: suits["swords"]+=1
+        elif "wands" in code: suits["wands"]+=1
+        elif "pentacles" in code: suits["pentacles"]+=1
+        else:
+            if not code.startswith("major_"):
+                suits["other"]+=1
 
     suit_hint = max(suits, key=suits.get) if cards else "other"
     suit_text_map = {
         "cups": "эмоции и отношения",
-        "swords": "мысли, выбор и напряжение",
-        "wands": "действия, энергия и инициативы",
-        "pentacles": "материальные вопросы и стабильность",
-        "other": "разнородные влияния",
+        "swords": "мысли и выбор",
+        "wands": "действия и энергия",
+        "pentacles": "материальные вопросы",
+        "other": "разные влияния",
     }
-    suit_text = suit_text_map.get(suit_hint, "разнородные влияния")
+    suit_text = suit_text_map.get(suit_hint, "разные влияния")
 
     lines = []
     if spread == "1":
-        lines.append("Итог: карта-совет акцентирует ключевой фокус. Прислушайтесь к себе, но решение остаётся за вами.")
+        lines.append("Итог: карта-совет выделяет главный фокус — прислушайтесь к себе.")
     else:
         lines.append("Итог расклада:")
         if majors >= 2:
-            lines.append("• Много старших арканов — сейчас время важных перемен.")
+            lines.append("• Много старших арканов — важные перемены.")
         elif majors == 1:
-            lines.append("• Один старший аркан — выделяется центральная тема.")
+            lines.append("• Один старший аркан — есть ключевая тема.")
         if reversed_cnt >= 2:
-            lines.append("• Много перевёрнутых карт — внутренние сомнения и блоки влияют сильнее внешних факторов.")
-        lines.append(f"• Преобладающая тема: {suit_text}.")
+            lines.append("• Много перевёрнутых карт — внутренние сомнения сильны.")
+        lines.append(f"• Преобладает тема: {suit_text}.")
         if topic.lower() != "общее":
             lines.append(f"• Контекст: {topic}.")
         if question:
             lines.append(f"• Вопрос: {question}")
-        lines.append("Помните: карты показывают тенденции, но выбор остаётся за вами.")
-
+        lines.append("Помните: карты показывают тенденции, но выбор за вами.")
     return "\n".join(lines)
 
 def format_spread_text(spread: str, cards: List[Dict[str, Any]]) -> str:
@@ -226,13 +221,10 @@ def check_cooldown(user_id: int) -> Optional[int]:
 def mark_used(user_id: int):
     LAST_USED_AT[user_id] = time.time()
 
-# -------------------- команды --------------------
+# -------------------- хендлеры --------------------
 @dp.message_handler(commands=["start"])
 async def cmd_start(m: types.Message):
-    await m.answer(
-        "Привет! Это бот раскладов на Таро 🎴\nВыберите расклад через /menu.",
-        reply_markup=menu_kb()
-    )
+    await m.answer("Привет! Это бот раскладов на Таро 🎴", reply_markup=menu_kb())
 
 @dp.message_handler(commands=["menu"])
 async def cmd_menu(m: types.Message):
@@ -246,26 +238,25 @@ async def cmd_history(m: types.Message):
     lines = ["<b>Последние расклады:</b>"]
     for it in reversed(items):
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(it["ts"]))
-        lines.append(f"• {when} — {('1 карта' if it['spread']=='1' else '3 карты')}: {it['topic']} — «{it['question'] or 'без вопроса'}»")
+        lines.append(f"• {when} — {('1 карта' if it['spread']=='1' else '3 карты')}: {it['topic']}")
     await m.answer("\n".join(lines))
 
-# -------------------- кнопки --------------------
 @dp.message_handler(lambda m: m.text in {"🔮 1 карта — совет", "🔮 3 карты — П/Н/Б"})
 async def on_pick_spread(m: types.Message):
     remain = check_cooldown(m.from_user.id)
     if remain:
-        return await m.answer(f"Подождите ещё {remain} сек 🙏")
+        return await m.answer(f"Подождите {remain} сек ⏳")
     spread = "1" if "1 карта" in m.text else "3"
     WAIT_TOPIC[m.from_user.id] = {"spread": spread}
     await m.answer("Выберите тему:", reply_markup=topics_kb())
 
-@dp.message_handler(lambda m: m.text in {"Отношения", "Работа", "Деньги", "Общее"})
+@dp.message_handler(lambda m: m.text in {"Отношения","Работа","Деньги","Общее"})
 async def on_pick_topic(m: types.Message):
     state = WAIT_TOPIC.pop(m.from_user.id, None)
     if not state:
         return await m.answer("Сначала выберите расклад.")
     WAIT_QUESTION[m.from_user.id] = {"spread": state["spread"], "topic": m.text}
-    await m.answer("Сформулируйте вопрос.", reply_markup=ReplyKeyboardMarkup(resize_keyboard=True).add(KeyboardButton("❌ Отмена")))
+    await m.answer("Напишите ваш вопрос одним сообщением.")
 
 @dp.message_handler(lambda m: m.text == "❌ Отмена")
 async def on_cancel(m: types.Message):
@@ -273,22 +264,19 @@ async def on_cancel(m: types.Message):
     WAIT_QUESTION.pop(m.from_user.id, None)
     await m.answer("Отменено.", reply_markup=menu_kb())
 
-# -------------------- текст --------------------
 @dp.message_handler()
 async def on_free_text(m: types.Message):
     qstate = WAIT_QUESTION.pop(m.from_user.id, None)
     if qstate:
-        spread = qstate["spread"]
-        topic = qstate["topic"]
-        question = m.text.strip()
+        spread, topic, question = qstate["spread"], qstate["topic"], m.text.strip()
         remain = check_cooldown(m.from_user.id)
         if remain:
             WAIT_QUESTION[m.from_user.id] = qstate
-            return await m.answer(f"Подождите ещё {remain} сек 🙏")
-        n = 1 if spread == "1" else 3
+            return await m.answer(f"Подождите {remain} сек ⏳")
+        n = 1 if spread=="1" else 3
         cards = pick_cards(n)
         if not cards:
-            return await m.answer("Колода недоступна.", reply_markup=menu_kb())
+            return await m.answer("Колода недоступна.")
         body = format_spread_text(spread, cards)
         summary = summarize_spread(cards, spread, topic, question)
         media_urls = [card_image_url(c) for c in cards if card_image_url(c)]
@@ -296,46 +284,28 @@ async def on_free_text(m: types.Message):
             media = [types.InputMediaPhoto(media=media_urls[0], caption=f"<b>Ваш расклад</b>\n\n{body}", parse_mode=ParseMode.HTML)]
             for u in media_urls[1:]:
                 media.append(types.InputMediaPhoto(media=u))
-            try:
-                await m.answer_media_group(media)
-            except Exception as e:
-                log.warning("Media group error: %r", e)
-                await m.answer(f"<b>Ваш расклад</b>\n\n{body}")
+            await m.answer_media_group(media)
         else:
             await m.answer(f"<b>Ваш расклад</b>\n\n{body}")
         await m.answer(summary, reply_markup=menu_kb())
-        HISTORY[m.from_user.id].append({
-            "ts": time.time(),
-            "spread": spread,
-            "topic": topic,
-            "question": question,
-            "cards": [{"code": c["code"], "reversed": bool(c["reversed_flag"])} for c in cards],
-        })
+        HISTORY[m.from_user.id].append({"ts": time.time(), "spread": spread,"topic": topic,"question": question})
         mark_used(m.from_user.id)
         return
-    if m.text.startswith("/"):
-        return
-    await m.answer("Выберите расклад через /menu.", reply_markup=menu_kb())
+    if not m.text.startswith("/"):
+        await m.answer("Выберите расклад через /menu.", reply_markup=menu_kb())
 
 # -------------------- запуск --------------------
 async def on_startup(app_: web.Application):
-    if not RENDER_EXTERNAL_URL:
-        log.warning("RENDER_EXTERNAL_URL не задан — webhook не будет установлен.")
-        return
-    url = f"https://{RENDER_EXTERNAL_URL}/webhook"
-    try:
-        ok = await set_webhook(dp, url)
-        if ok:
-            log.info("Webhook установлен: %s", url)
-        else:
-            log.error("Не удалось установить webhook: %s", url)
-    except Exception as e:
-        log.error("Ошибка при установке webhook: %s", e)
+    if RENDER_EXTERNAL_URL:
+        url = f"https://{RENDER_EXTERNAL_URL}/webhook"
+        log.info("Webhook URL (установите вручную через setWebhook): %s", url)
+    else:
+        log.warning("RENDER_EXTERNAL_URL не задан.")
 
 def main():
     port = int(os.getenv("PORT", "10000"))
+    app.on_startup.append(on_startup)
     web.run_app(app, host="0.0.0.0", port=port, print=None)
 
 if __name__ == "__main__":
-    app.on_startup.append(on_startup)
     main()
