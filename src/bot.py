@@ -1,521 +1,327 @@
+# src/bot.py
+# -*- coding: utf-8 -*-
 import os
 import json
-import random
-import logging
 import time
-import sqlite3
+import logging
+import random
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-
+from typing import Dict, Any, List, Optional
 import requests
+
 from aiogram import Bot, Dispatcher, types
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.dispatcher import FSMContext
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from aiogram.utils.executor import start_webhook
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
-# =========================
-# ENV & constants
-# =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DECK_URL = os.getenv("DECK_URL", "").strip()  # CDN deck.json (jsDelivr)
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "360"))  # 6 минут по умолчанию
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
-
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-WEBAPP_HOST = "0.0.0.0"
-WEBAPP_PORT = int(os.getenv("PORT", "10000"))
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}" if RENDER_EXTERNAL_URL else f"http://localhost:{WEBAPP_PORT}{WEBHOOK_PATH}"
-
-# =========================
-# Logging
-# =========================
+###############################################################################
+# Конфигурация
+###############################################################################
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tarot-bot")
 
-# =========================
-# Bot / Dispatcher (FSM)
-# =========================
-bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(bot, storage=storage)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
 
-# =========================
-# Data dirs & DB
-# =========================
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / "history.db"
+# Render даёт внешний адрес — используем его для вебхука
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+WEBAPP_HOST = "0.0.0.0"
+WEBAPP_PORT = int(os.getenv("PORT", "5000"))
 
-def _db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS history (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_id INTEGER NOT NULL,
-          ts INTEGER NOT NULL,
-          spread TEXT NOT NULL,
-          category TEXT,
-          topic TEXT,
-          cards_json TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS cooldown (
-          user_id INTEGER PRIMARY KEY,
-          last_ts INTEGER NOT NULL
-        )
-    """)
-    conn.commit()
-    return conn
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}" if RENDER_EXTERNAL_URL else ""
 
-# =========================
-# Deck loading
-# =========================
-deck: Dict[str, Any] = {"cards": []}
-cards: List[Dict[str, Any]] = []
-image_base_url: str = ""
-reversals_percent: int = 30
+# Пути/источники колоды
+LOCAL_DECK_PATH = Path("data/deck.json")
+DECK_URL = os.getenv("DECK_URL", "").strip()
 
-def load_deck() -> Dict[str, Any]:
-    """
-    1) Сначала пытаемся прочитать локальный data/deck.json
-    2) Если не вышло — тянем по DECK_URL (jsDelivr)
-    """
-    local_path = DATA_DIR / "deck.json"
-    if local_path.exists():
-        try:
-            with open(local_path, "r", encoding="utf-8") as f:
-                d = json.load(f)
-                log.info("Колода загружена локально: %s карт", len(d.get("cards", [])))
-                return d
-        except Exception as e:
-            log.warning("Не удалось прочитать локальную колоду: %r", e)
+# Лимит на частоту раскладов (сек)
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "360"))
 
-    if DECK_URL:
-        try:
-            r = requests.get(DECK_URL, timeout=10)
-            r.raise_for_status()
-            d = r.json()
-            log.info("Колода загружена по URL (%s): %s карт", DECK_URL, len(d.get("cards", [])))
-            return d
-        except Exception as e:
-            log.error("Не удалось загрузить колоду по URL (%s): %r", DECK_URL, e)
+# Админы (могут игнорировать кулдаун)
+ADMIN_IDS: set = set()
+_admin_raw = os.getenv("ADMIN_IDS", "").strip()
+if _admin_raw:
+    for p in _admin_raw.split(","):
+        p = p.strip()
+        if p.isdigit():
+            ADMIN_IDS.add(int(p))
 
-    log.error("Колода не загружена ни локально, ни по URL — работаю с пустой.")
-    return {"cards": []}
+###############################################################################
+# Инициализация бота/Диспетчера/Памяти
+###############################################################################
+bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
+dp = Dispatcher(bot, storage=MemoryStorage())
 
-def deck_init():
-    global deck, cards, image_base_url, reversals_percent
-    deck = load_deck()
-    cards = deck.get("cards", [])
-    image_base_url = (deck.get("image_base_url") or "").rstrip("/")
-    reversals_percent = int(deck.get("reversals_percent", 30))
+###############################################################################
+# Состояния
+###############################################################################
+class SpreadStates(StatesGroup):
+    kind = State()      # "one" | "three"
+    topic = State()     # "relations" | "work" | "money" | "general"
+    question = State()  # текст вопроса
 
-deck_init()
+###############################################################################
+# Данные колоды + служебные структуры
+###############################################################################
+DECK: Dict[str, Any] = {}
+CARDS: List[Dict[str, Any]] = []   # список карточек
+IMAGE_BASE: str = ""               # base URL/путь для картинок
+LAST_USED_AT: Dict[int, float] = {}  # user_id -> ts последнего расклада
 
-# =========================
-# Helpers: text & cooldown
-# =========================
-CATEGORIES = [
-    ("relationships", "❤️ Отношения"),
-    ("work", "💼 Работа"),
-    ("money", "💰 Деньги"),
-    ("health", "🩺 Здоровье"),
-    ("growth", "🌱 Саморазвитие"),
-    ("general", "✨ Общее"),
-]
+def _load_deck_local() -> Dict[str, Any]:
+    if not LOCAL_DECK_PATH.exists():
+        raise FileNotFoundError(str(LOCAL_DECK_PATH))
+    with LOCAL_DECK_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
-def _is_blank(val: Optional[str]) -> bool:
-    return not val or val.strip() == "" or val.strip() == "…"
+def _load_deck_remote(url: str) -> Dict[str, Any]:
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    return r.json()
 
-def format_mmss(seconds: int) -> str:
-    m = seconds // 60
-    s = seconds % 60
-    if m and s:
-        return f"{m} мин {s} сек"
-    if m:
-        return f"{m} мин"
-    return f"{s} сек"
+def _normalize_base_url(s: str) -> str:
+    # Убираем завершающий / если есть
+    return s[:-1] if s.endswith("/") else s
 
-def pick_card() -> Dict[str, Any]:
-    c = random.choice(cards).copy()
-    c["is_reversed"] = (random.randint(1, 100) <= reversals_percent)
-    return c
+def _pick_cards(n: int, allow_reversed: bool = True, reversals_percent: int = 30) -> List[Dict[str, Any]]:
+    if not CARDS:
+        return []
+    chosen = random.sample(CARDS, k=min(n, len(CARDS)))
+    out = []
+    for c in chosen:
+        is_reversed = allow_reversed and (random.randint(1, 100) <= reversals_percent)
+        out.append({
+            "code": c.get("code"),
+            "title_en": c.get("title_en"),
+            "title_ru": c.get("title_ru"),
+            "image": c.get("image"),
+            "upright": c.get("upright") or "",
+            "reversed": c.get("reversed") or "",
+            "reversed_flag": is_reversed,
+        })
+    return out
 
-def card_caption(card: Dict[str, Any]) -> str:
-    title_ru = card.get("title_ru") or card.get("title_en") or "Карта"
-    orientation = "Перевёрнутая" if card.get("is_reversed") else "Прямая"
-    return f"{title_ru}\n{orientation}"
+def _cooldown_left(user_id: int) -> int:
+    if user_id in ADMIN_IDS:
+        return 0
+    last = LAST_USED_AT.get(user_id, 0.0)
+    delta = time.time() - last
+    left = COOLDOWN_SECONDS - int(delta)
+    return max(0, left)
 
-def card_image_url(card: Dict[str, Any]) -> str:
-    img_name = card.get("image", "")
-    if not img_name:
-        return ""
-    if image_base_url:
-        return f"{image_base_url}/{img_name}"
-    return img_name
+def _set_used_now(user_id: int) -> None:
+    LAST_USED_AT[user_id] = time.time()
 
-def meaning_text(card: Dict[str, Any]) -> str:
-    is_rev = card.get("is_reversed", False)
-    raw = (card.get("reversed") if is_rev else card.get("upright")) or ""
-    if not _is_blank(raw):
-        return raw.strip()
-    title = card.get("title_ru") or card.get("title_en") or "Карта"
-    if is_rev:
-        return f"{title}: перевёрнутая динамика — тема требует аккуратности, переоценки ожиданий и времени."
+def _cards_text_block(spread_kind: str, cards: List[Dict[str, Any]]) -> str:
+    # Текстовая сводка расклада с краткими подписями
+    if spread_kind == "one":
+        c = cards[0]
+        dir_text = "перевёрнута" if c["reversed_flag"] else "прямая"
+        title = c.get("title_ru") or c.get("title_en") or c.get("code", "карта")
+        meaning = (c["reversed"] if c["reversed_flag"] else c["upright"]) or "Описание скоро добавим."
+        return f"🃏 <b>1 карта</b>\n<b>{title}</b> ({dir_text})\n\n{meaning}"
     else:
-        return f"{title}: прямая динамика — энергия благоприятна, действуйте осознанно и последовательно."
+        labels = ["Прошлое", "Настоящее", "Будущее"]
+        lines = [f"🔮 <b>3 карты</b>"]
+        for label, c in zip(labels, cards):
+            dir_text = "перевёрнута" if c["reversed_flag"] else "прямая"
+            title = c.get("title_ru") or c.get("title_en") or c.get("code", "карта")
+            meaning = (c["reversed"] if c["reversed_flag"] else c["upright"]) or "Описание скоро добавим."
+            lines.append(f"\n<b>{label}:</b> {title} ({dir_text})\n{meaning}")
+        return "\n".join(lines)
 
-def summarize_reading(topic: str, category_code: str, picked: List[Dict[str, Any]]) -> str:
-    rev_count = sum(1 for c in picked if c.get("is_reversed"))
-    tendency = "скорее благоприятна" if rev_count <= len(picked) // 2 else "требует осторожности"
-    human_cat = dict(CATEGORIES).get(category_code, "✨ Общее")
-    advice = "Двигайтесь шаг за шагом, отмечая промежуточные результаты." if rev_count else "Хороший момент для инициативы, но не забывайте о последствиях."
-    return (
-        f"Тема: {human_cat}. Запрос: {topic}\n"
-        f"Перевёрнутых карт: {rev_count} из {len(picked)} — тенденция {tendency}.\n"
-        f"Итог: {advice}\n\n"
-        "Помните: решения принимаете вы. Любой выбор тянет последствия — выбирайте то, что поддерживает вас в долгую."
-    )
+def _card_image_url(card: Dict[str, Any]) -> Optional[str]:
+    img = card.get("image")
+    if not img or not IMAGE_BASE:
+        return None
+    return f"{IMAGE_BASE}/{img}"
 
-# ----- cooldown & history -----
-def get_last_ts(user_id: int) -> Optional[int]:
-    with _db() as conn:
-        cur = conn.execute("SELECT last_ts FROM cooldown WHERE user_id=?", (user_id,))
-        row = cur.fetchone()
-        return row[0] if row else None
-
-def set_last_ts(user_id: int, ts: int):
-    with _db() as conn:
-        conn.execute(
-            "INSERT INTO cooldown(user_id, last_ts) VALUES(?, ?) "
-            "ON CONFLICT(user_id) DO UPDATE SET last_ts=excluded.last_ts",
-            (user_id, ts),
-        )
-        conn.commit()
-
-def check_cooldown(user_id: int) -> Tuple[bool, int]:
-    """
-    return (allowed, seconds_left)
-    """
-    now = int(time.time())
-    last = get_last_ts(user_id)
-    if last is None:
-        return True, 0
-    diff = now - last
-    if diff >= COOLDOWN_SECONDS:
-        return True, 0
-    return False, COOLDOWN_SECONDS - diff
-
-def cooldown_kb() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("🔄 Проверить", callback_data="cooldown:check"))
-    kb.add(InlineKeyboardButton("⬅️ Меню", callback_data="menu:open"))
+###############################################################################
+# UI клавиатуры
+###############################################################################
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(KeyboardButton("🃏 1 карта — совет"))
+    kb.add(KeyboardButton("🔮 3 карты — п/н/б"))
     return kb
 
-def save_history(user_id: int, spread: str, category: str, topic: str, picked: List[Dict[str, Any]]):
-    payload = {
-        "cards": [
-            {
-                "code": c.get("code"),
-                "title_ru": c.get("title_ru"),
-                "is_reversed": c.get("is_reversed", False),
-            } for c in picked
-        ]
-    }
-    with _db() as conn:
-        conn.execute(
-            "INSERT INTO history(user_id, ts, spread, category, topic, cards_json) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, int(time.time()), spread, category, topic, json.dumps(payload, ensure_ascii=False)),
-        )
-        conn.commit()
+TOPIC_INLINE_KB = InlineKeyboardMarkup(row_width=2)
+TOPIC_INLINE_KB.add(
+    InlineKeyboardButton("❤️ Отношения", callback_data="topic:relations"),
+    InlineKeyboardButton("💼 Работа", callback_data="topic:work"),
+    InlineKeyboardButton("💰 Деньги", callback_data="topic:money"),
+    InlineKeyboardButton("✨ Общее", callback_data="topic:general"),
+)
 
-def fetch_history(user_id: int, limit: int = 5) -> List[Dict[str, Any]]:
-    with _db() as conn:
-        cur = conn.execute(
-            "SELECT ts, spread, category, topic, cards_json FROM history WHERE user_id=? ORDER BY ts DESC LIMIT ?",
-            (user_id, limit),
-        )
-        out = []
-        for ts, spread, category, topic, cards_json in cur.fetchall():
-            out.append({
-                "ts": ts,
-                "spread": spread,
-                "category": category,
-                "topic": topic,
-                "cards": json.loads(cards_json).get("cards", []),
-            })
-        return out
-
-# =========================
-# FSM states
-# =========================
-class Flow(StatesGroup):
-    choosing_spread = State()
-    choosing_category_for_one = State()
-    entering_topic_for_one = State()
-    choosing_category_for_three = State()
-    entering_topic_for_three = State()
-
-# =========================
-# Keyboards
-# =========================
-def kb_main() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("1 карта", callback_data="spread:one"),
-        InlineKeyboardButton("3 карты", callback_data="spread:three"),
+###############################################################################
+# Хэндлеры
+###############################################################################
+@dp.message_handler(commands=["start"])
+async def cmd_start(m: types.Message, state: FSMContext):
+    await state.finish()
+    await m.answer(
+        "Привет! Я делаю онлайн-расклады на Таро Райдер–Уэйт.\n"
+        "Выбери тип расклада в меню ниже 👇\n\n"
+        "Помни: решения принимаешь ты сам(а). Карты — это подсказки, а не приговор.",
+        reply_markup=main_menu_kb(),
     )
-    kb.add(InlineKeyboardButton("🗂 История", callback_data="history:open"))
-    return kb
 
-def kb_categories(prefix: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=2)
-    for code, label in CATEGORIES:
-        kb.insert(InlineKeyboardButton(label, callback_data=f"{prefix}:{code}"))
-    return kb
+@dp.message_handler(commands=["menu"])
+async def cmd_menu(m: types.Message, state: FSMContext):
+    await state.finish()
+    await m.answer("Выбери тип расклада:", reply_markup=main_menu_kb())
 
-# =========================
-# Commands & menu
-# =========================
-@dp.message_handler(commands=["start", "help", "menu"])
-async def start_menu(m: types.Message, state: FSMContext):
-    text = (
-        "Привет! Я Таро-бот 🔮\n\n"
-        "Выберите расклад или откройте историю.\n"
-        "Важно: это развлекательный сервис. Решения — на вашей стороне."
-    )
-    await m.answer(text, reply_markup=kb_main())
-    await Flow.choosing_spread.set()
+@dp.message_handler(commands=["ping"])
+async def cmd_ping(m: types.Message):
+    await m.answer("pong")
 
 @dp.message_handler(commands=["status"])
-async def status_cmd(m: types.Message):
-    allowed, left = check_cooldown(m.from_user.id)
-    cd_text = "Готово к раскладу ✅" if allowed else f"Осталось: {format_mmss(left)}"
+async def cmd_status(m: types.Message):
     await m.answer(
         "Статус:\n"
-        f"— Колода: {len(cards)} карт\n"
-        f"— Кулдаун: {cd_text}"
+        f"- Колода: {DECK.get('name_ru') or DECK.get('name_en') or 'не загружена'}\n"
+        f"- Карт: {len(CARDS)}\n"
+        f"- База изображений: {IMAGE_BASE or '—'}\n"
+        f"- Кулдаун: {COOLDOWN_SECONDS} сек\n"
+        f"- Вебхук: {'OK' if WEBHOOK_URL else 'не сконфигурирован'}",
     )
 
 @dp.message_handler(commands=["resetwebhook"])
-async def reset_webhook(m: types.Message):
-    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
-    await m.reply(f"Webhook переустановлен:\n{WEBHOOK_URL}")
+async def cmd_resetwebhook(m: types.Message):
+    if not WEBHOOK_URL:
+        return await m.answer("RENDER_EXTERNAL_URL не задан. Вебхук нельзя выставить автоматически.")
+    await bot.set_webhook(WEBHOOK_URL)
+    await m.answer(f"Вебхук переустановлен:\n{WEBHOOK_URL}")
 
-# =========================
-# Cooldown controls
-# =========================
-@dp.callback_query_handler(lambda c: c.data == "cooldown:check", state="*")
-async def cooldown_check(cq: CallbackQuery, state: FSMContext):
-    allowed, left = check_cooldown(cq.from_user.id)
-    if allowed:
-        await cq.message.answer("Можно делать новый расклад ✅", reply_markup=kb_main())
-        await Flow.choosing_spread.set()
-    else:
-        await cq.message.answer(f"Ещё рано. Осталось: {format_mmss(left)}", reply_markup=cooldown_kb())
+# Кнопки меню (тексты)
+@dp.message_handler(lambda msg: msg.text and msg.text.startswith("🃏"))
+async def choose_onecard(m: types.Message, state: FSMContext):
+    left = _cooldown_left(m.from_user.id)
+    if left > 0:
+        return await m.answer(f"Подожди ещё {left} сек перед новым раскладом 🙏")
+
+    await state.update_data(kind="one")
+    await SpreadStates.topic.set()
+    await m.answer("На какую тему делаем расклад?", reply_markup=types.ReplyKeyboardRemove())
+    await m.answer("Выбери тему:", reply_markup=TOPIC_INLINE_KB)
+
+@dp.message_handler(lambda msg: msg.text and msg.text.startswith("🔮"))
+async def choose_threecards(m: types.Message, state: FSMContext):
+    left = _cooldown_left(m.from_user.id)
+    if left > 0:
+        return await m.answer(f"Подожди ещё {left} сек перед новым раскладом 🙏")
+
+    await state.update_data(kind="three")
+    await SpreadStates.topic.set()
+    await m.answer("На какую тему делаем расклад?", reply_markup=types.ReplyKeyboardRemove())
+    await m.answer("Выбери тему:", reply_markup=TOPIC_INLINE_KB)
+
+# Выбор темы (inline)
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("topic:"), state=SpreadStates.topic)
+async def topic_selected(cq: types.CallbackQuery, state: FSMContext):
+    topic = cq.data.split(":", 1)[1]
+    await state.update_data(topic=topic)
+    await SpreadStates.question.set()
+    await cq.message.edit_reply_markup()  # убрать кнопки
+    await cq.message.answer("Сформулируй свой вопрос в одном-двух предложениях.")
     await cq.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "menu:open", state="*")
-async def menu_open(cq: CallbackQuery, state: FSMContext):
-    await cq.message.answer("Меню:", reply_markup=kb_main())
-    await Flow.choosing_spread.set()
-    await cq.answer()
-
-# =========================
-# History open
-# =========================
-@dp.callback_query_handler(lambda c: c.data == "history:open", state="*")
-async def open_history(cq: CallbackQuery, state: FSMContext):
-    user_id = cq.from_user.id
-    rows = fetch_history(user_id, limit=5)
-    if not rows:
-        await cq.message.answer("История пуста. Сделайте первый расклад!")
-    else:
-        parts = ["Последние расклады:"]
-        for i, h in enumerate(rows, start=1):
-            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(h["ts"]))
-            parts.append(f"{i}) {when} • {h['spread']} • {dict(CATEGORIES).get(h['category'], h['category'])}\n— {h['topic']}")
-        await cq.message.answer("\n\n".join(parts))
-    await cq.answer()
-
-# =========================
-# Choose spread
-# =========================
-async def enforce_cooldown_or_menu(message_obj, user_id: int) -> bool:
-    """Возвращает True если ДАЛЬШЕ НЕЛЬЗЯ (сработал кулдаун и уже отправили клавиатуру проверки)."""
-    allowed, left = check_cooldown(user_id)
-    if allowed:
-        return False
-    # показать проверку
-    if isinstance(message_obj, types.Message):
-        await message_obj.answer(f"Подождите ещё {format_mmss(left)} 🙏", reply_markup=cooldown_kb())
-    else:
-        # fallback
-        await bot.send_message(user_id, f"Подождите ещё {format_mmss(left)} 🙏", reply_markup=cooldown_kb())
-    return True
-
-@dp.callback_query_handler(lambda c: c.data.startswith("spread:"), state=Flow.choosing_spread)
-async def choose_spread(cq: CallbackQuery, state: FSMContext):
-    if await enforce_cooldown_or_menu(cq.message, cq.from_user.id):
-        await cq.answer()
-        return
-
-    spread = cq.data.split(":", 1)[1]  # one | three
-    if spread == "one":
-        await state.update_data(spread="one")
-        await cq.message.answer("Выберите тему:", reply_markup=kb_categories("cat_one"))
-        await Flow.choosing_category_for_one.set()
-    elif spread == "three":
-        if len(cards) < 3:
-            await cq.message.answer("Карточек пока мало для 3-картного расклада 😕")
-            await cq.answer()
-            return
-        await state.update_data(spread="three")
-        await cq.message.answer("Выберите тему:", reply_markup=kb_categories("cat_three"))
-        await Flow.choosing_category_for_three.set()
-    await cq.answer()
-
-# =========================
-# Fallback: /card & /three (тоже с кулдауном)
-# =========================
-@dp.message_handler(commands=["card"])
-async def cmd_card(m: types.Message, state: FSMContext):
-    if await enforce_cooldown_or_menu(m, m.from_user.id):
-        return
-    if not cards:
-        await m.reply("Колода пока недоступна 😕")
-        return
-    await state.update_data(spread="one")
-    await m.reply("Выберите тему:", reply_markup=kb_categories("cat_one"))
-    await Flow.choosing_category_for_one.set()
-
-@dp.message_handler(commands=["three"])
-async def cmd_three(m: types.Message, state: FSMContext):
-    if await enforce_cooldown_or_menu(m, m.from_user.id):
-        return
-    if len(cards) < 3:
-        await m.reply("Карточек пока мало для 3-картного расклада 😕")
-        return
-    await state.update_data(spread="three")
-    await m.reply("Выберите тему:", reply_markup=kb_categories("cat_three"))
-    await Flow.choosing_category_for_three.set()
-
-# =========================
-# Categories → topic
-# =========================
-@dp.callback_query_handler(lambda c: c.data.startswith("cat_one:"), state=Flow.choosing_category_for_one)
-async def cat_one(cq: CallbackQuery, state: FSMContext):
-    category = cq.data.split(":", 1)[1]
-    await state.update_data(category=category)
-    await cq.message.answer("Коротко опишите запрос одной фразой:")
-    await Flow.entering_topic_for_one.set()
-    await cq.answer()
-
-@dp.callback_query_handler(lambda c: c.data.startswith("cat_three:"), state=Flow.choosing_category_for_three)
-async def cat_three(cq: CallbackQuery, state: FSMContext):
-    category = cq.data.split(":", 1)[1]
-    await state.update_data(category=category)
-    await cq.message.answer("Коротко опишите запрос одной фразой:")
-    await Flow.entering_topic_for_three.set()
-    await cq.answer()
-
-# =========================
-# Do spreads
-# =========================
-def pick_and_send_card_message(m: types.Message, caption_prefix: str, card: Dict[str, Any]):
-    cap = caption_prefix + card_caption(card)
-    img = card_image_url(card)
-    return (img, cap)
-
-@dp.message_handler(state=Flow.entering_topic_for_one)
-async def do_one(m: types.Message, state: FSMContext):
-    if not cards:
-        await m.reply("Колода пока недоступна 😕")
-        await state.finish()
-        return
-
+# Получение вопроса и выполнение расклада
+@dp.message_handler(state=SpreadStates.question, content_types=types.ContentTypes.TEXT)
+async def receive_question_and_spread(m: types.Message, state: FSMContext):
     data = await state.get_data()
-    topic = (m.text or "").strip()
-    category = data.get("category", "general")
+    kind = data.get("kind", "one")
+    topic = data.get("topic", "general")
+    question = m.text.strip()
 
-    c = pick_card()
-    img, cap = pick_and_send_card_message(m, "", c)
-    if img:
-        await m.answer_photo(photo=img, caption=cap)
-    else:
-        await m.reply(cap)
-
-    meaning = meaning_text(c)
-    summary = summarize_reading(topic, category, [c])
-    await m.answer(f"Интерпретация:\n— {meaning}\n\n{summary}")
-
-    # save & cooldown
-    save_history(m.from_user.id, "one", category, topic, [c])
-    set_last_ts(m.from_user.id, int(time.time()))
-
-    await m.answer("Готово. Вернуться в меню:", reply_markup=kb_main())
-    await Flow.choosing_spread.set()
-
-@dp.message_handler(state=Flow.entering_topic_for_three)
-async def do_three(m: types.Message, state: FSMContext):
-    if len(cards) < 3:
-        await m.reply("Карточек пока мало для 3-картного расклада 😕")
+    # Кулдаун (повторная проверка, если пользователь затянул)
+    left = _cooldown_left(m.from_user.id)
+    if left > 0:
         await state.finish()
-        return
+        return await m.answer(f"Подожди ещё {left} сек перед новым раскладом 🙏", reply_markup=main_menu_kb())
 
-    data = await state.get_data()
-    topic = (m.text or "").strip()
-    category = data.get("category", "general")
+    # Выбор карт
+    reversals_percent = int(DECK.get("reversals_percent", 30))
+    if kind == "one":
+        cards = _pick_cards(1, allow_reversed=True, reversals_percent=reversals_percent)
+    else:
+        cards = _pick_cards(3, allow_reversed=True, reversals_percent=reversals_percent)
 
-    chosen = random.sample(cards, 3)
-    positions = ["Прошлое", "Настоящее", "Будущее"]
-    picked = []
+    if not cards:
+        await state.finish()
+        return await m.answer("Колода недоступна. Попробуй позже.", reply_markup=main_menu_kb())
 
-    for i, base in enumerate(chosen):
-        card = base.copy()
-        card["is_reversed"] = (random.randint(1, 100) <= reversals_percent)
-        picked.append(card)
+    # Текстовая сводка
+    summary = _cards_text_block(kind, cards)
+    intro = (
+        f"Тема: <b>{topic}</b>\n"
+        f"Вопрос: <i>{question}</i>\n\n"
+    )
+    await m.answer(intro + summary)
 
-        cap_prefix = f"{positions[i]} • "
-        img, cap = pick_and_send_card_message(m, cap_prefix, card)
-        if img:
-            await m.answer_photo(photo=img, caption=cap)
+    # Картинки карт (если доступны URL)
+    for c in cards:
+        url = _card_image_url(c)
+        if url:
+            caption = (c.get("title_ru") or c.get("title_en") or c.get("code", "Карта"))
+            if c["reversed_flag"]:
+                caption += " (перевёрнута)"
+            try:
+                await m.answer_photo(url, caption=caption)
+            except Exception as e:
+                log.warning(f"Не удалось отправить изображение {url}: {e}")
+
+    _set_used_now(m.from_user.id)
+    await state.finish()
+    await m.answer("Готово. Чтобы сделать новый расклад — нажми /menu", reply_markup=main_menu_kb())
+
+###############################################################################
+# Вебхук-роут и стартап/шутдаун
+###############################################################################
+async def on_startup(dp: Dispatcher):
+    # 1) Загрузка колоды
+    global DECK, CARDS, IMAGE_BASE
+    try:
+        if LOCAL_DECK_PATH.exists():
+            DECK = _load_deck_local()
+            log.info("Колода загружена локально из data/deck.json")
+        elif DECK_URL:
+            DECK = _load_deck_remote(DECK_URL)
+            log.info(f"Колода загружена по URL: {DECK_URL}")
         else:
-            await m.reply(cap)
-        await m.answer(f"Краткая интерпретация ({positions[i]}):\n— {meaning_text(card)}")
+            DECK = {}
+            log.error("Колода не загружена: нет data/deck.json и DECK_URL")
+    except Exception as e:
+        DECK = {}
+        log.error(f"Не удалось загрузить колоду: {e}")
 
-    summary = summarize_reading(topic, category, picked)
-    await m.answer(summary)
+    CARDS = DECK.get("cards", []) if isinstance(DECK, dict) else []
+    IMAGE_BASE = _normalize_base_url(DECK.get("image_base_url", "")) if isinstance(DECK, dict) else ""
 
-    # save & cooldown
-    save_history(m.from_user.id, "three", category, topic, picked)
-    set_last_ts(m.from_user.id, int(time.time()))
+    # 2) Вебхук
+    if not WEBHOOK_URL:
+        log.warning("RENDER_EXTERNAL_URL не задан — вебхук автоматически не выставлен.")
+    else:
+        await bot.set_webhook(WEBHOOK_URL)
+        log.info(f"Webhook установлен: {WEBHOOK_URL}")
 
-    await m.answer("Готово. Вернуться в меню:", reply_markup=kb_main())
-    await Flow.choosing_spread.set()
+async def on_shutdown(dp: Dispatcher):
+    try:
+        await bot.delete_webhook()
+    except Exception:
+        pass
+    await dp.storage.close()
+    await dp.storage.wait_closed()
 
-# =========================
-# Webhook lifecycle
-# =========================
-@dp.message_handler(commands=["ping"])
-async def ping(m: types.Message):
-    await m.answer("pong")
-
-async def on_startup(dp_: Dispatcher):
-    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
-    log.info("Webhook установлен: %s", WEBHOOK_URL)
-
-async def on_shutdown(dp_: Dispatcher):
-    log.info("Удаляю вебхук…")
-    await bot.delete_webhook()
-
-def main():
+###############################################################################
+# Запуск
+###############################################################################
+if __name__ == "__main__":
+    # Вебхук сервер на Render: должен слушать порт, который Render задаёт в $PORT
     start_webhook(
         dispatcher=dp,
         webhook_path=WEBHOOK_PATH,
@@ -525,6 +331,3 @@ def main():
         host=WEBAPP_HOST,
         port=WEBAPP_PORT,
     )
-
-if __name__ == "__main__":
-    main()
