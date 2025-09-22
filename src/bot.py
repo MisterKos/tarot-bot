@@ -1,154 +1,141 @@
-import json
-import logging
 import os
+import json
 import random
+import logging
+from collections import defaultdict, deque
+
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.utils.executor import start_webhook
+from aiogram.utils import executor
 
-# ================== НАСТРОЙКИ ==================
-API_TOKEN = os.getenv("TELEGRAM_TOKEN")
-WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL")  # например https://tarot-bot-12u6.onrender.com
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
-WEBAPP_HOST = "0.0.0.0"
-WEBAPP_PORT = int(os.getenv("PORT", 5000))
+# ---------------- CONFIG ----------------
+API_TOKEN = os.getenv("TELEGRAM_TOKEN") or "8162496264:AAEomZ-eUtqf_jESd6VZSpdHBYJsjPgds7o"
 
-logging.basicConfig(level=logging.INFO)
+DATA_PATH = "data/deck.json"
+HISTORY_PATH = "data/history.json"
+
+# ---------------- LOGGING ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("tarot-bot")
 
+# ---------------- BOT INIT ----------------
 bot = Bot(token=API_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(bot, storage=storage)
+dp = Dispatcher(bot)
 
-# ================== СОСТОЯНИЯ ==================
-class TarotStates(StatesGroup):
-    waiting_for_topic = State()
-    waiting_for_situation = State()
-    waiting_for_spread = State()
+# ---------------- LOAD DECK ----------------
+with open(DATA_PATH, "r", encoding="utf-8") as f:
+    DECK = json.load(f)["cards"]
 
-# ================== ЗАГРУЗКА КОЛОДЫ ==================
-with open("data/deck.json", "r", encoding="utf-8") as f:
-    deck = json.load(f)
-cards = deck["cards"]
-IMAGE_BASE = deck["image_base_url"]
+IMAGE_BASE_URL = "https://cdn.jsdelivr.net/gh/MisterKos/tarot-bot@main/assets/rw/cards/"
 
-# ================== ИСТОРИЯ ==================
-user_history = {}
+# ---------------- HISTORY ----------------
+if os.path.exists(HISTORY_PATH):
+    with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+        HISTORY = json.load(f)
+else:
+    HISTORY = defaultdict(list)
 
-def save_history(user_id, spread):
-    if user_id not in user_history:
-        user_history[user_id] = []
-    user_history[user_id].insert(0, spread)
-    user_history[user_id] = user_history[user_id][:5]
+def save_history():
+    with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+        json.dump(HISTORY, f, ensure_ascii=False, indent=2)
 
-# ================== КНОПКИ ==================
-def topic_kb():
+# ---------------- KEYBOARDS ----------------
+menu_kb = ReplyKeyboardMarkup(resize_keyboard=True)
+menu_kb.add("🔮 Отношения", "💼 Работа")
+menu_kb.add("💰 Финансы", "🌌 Общий расклад")
+
+def spreads_kb():
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("🔮 Отношения"), KeyboardButton("💼 Работа"))
-    kb.add(KeyboardButton("💰 Финансы"), KeyboardButton("🌟 Общий расклад"))
+    kb.add("1 карта", "3 карты", "Кельтский крест")
     return kb
 
-def spread_kb():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("1 карта"), KeyboardButton("3 карты"))
-    kb.add(KeyboardButton("Кельтский крест"))
-    return kb
+# ---------------- HELPERS ----------------
+def draw_cards(n=1):
+    return random.sample(DECK, n)
 
-# ================== ГЕНЕРАЦИЯ КАРТ ==================
-def draw_cards(n):
-    result = []
-    for _ in range(n):
-        card = random.choice(cards)
-        is_reversed = random.randint(1, 100) <= deck["reversals_percent"]
-        result.append({
-            "title": card["title_ru"],
-            "upright": card["upright"],
-            "reversed": card["reversed"],
-            "image": IMAGE_BASE + card["image"],
-            "is_reversed": is_reversed
-        })
-    return result
+def format_interpretation(card, position=None):
+    direction = random.choice(["upright", "reversed"])
+    title = f"{card['title_ru']} ({'Прямое' if direction == 'upright' else 'Перевёрнутое'})"
+    text = card[direction] if card[direction] != "…" else "Здесь идёт детальное толкование карты."
+    pos = f"Позиция: {position}\n" if position else ""
+    return f"✨ {title}\n{pos}{text}"
 
-def interpret_cards(cards_drawn, situation, topic, spread_type):
-    text = f"✨ Расклад по теме *{topic}* ({spread_type}) ✨\n\n"
-    positions = ["Прошлое", "Настоящее", "Будущее"]
+def final_summary(topic, situation, cards):
+    summary = f"🔔 Итог по теме «{topic}»:\n\n"
+    summary += f"Ситуация: {situation}\n\n"
+    summary += "Карты раскрывают многослойную картину происходящего. "
+    summary += "Опытный таролог сказал бы, что эти образы указывают на скрытые причины, возможные исходы и внутренние ресурсы. "
+    summary += "Важно обратить внимание на то, что совпадения не случайны, а сами карты словно ведут вас к переосмыслению.\n\n"
+    summary += "🌟 Совет: примите этот расклад как зеркало, позволяющее заглянуть вглубь себя. "
+    summary += "Используйте полученные инсайты для мудрых решений."
+    return summary
 
-    for i, card in enumerate(cards_drawn):
-        pos = positions[i] if spread_type == "3 карты" else f"Карта {i+1}"
-        orientation = "Перевёрнутая" if card["is_reversed"] else "Прямая"
-        meaning = card["reversed"] if card["is_reversed"] else card["upright"]
+# ---------------- FSM ----------------
+user_state = {}
+user_topic = {}
+user_situation = {}
 
-        text += f"🔹 *{pos}:* {card['title']} ({orientation})\n{meaning}\n\n"
-
-    text += f"🌙 *Итог:* В контексте вашей ситуации ({situation}), карты показывают общий совет: доверяйте процессу, ищите баланс и будьте открыты к переменам."
-    return text
-
-# ================== ХЕНДЛЕРЫ ==================
+# ---------------- HANDLERS ----------------
 @dp.message_handler(commands=["start"])
-async def cmd_start(message: types.Message, state: FSMContext):
-    await state.finish()
-    await message.answer("Привет! Я виртуальный таролог. ✨\nВыберите тему расклада:", reply_markup=topic_kb())
-    await TarotStates.waiting_for_topic.set()
-
-@dp.message_handler(lambda m: m.text in ["🔮 Отношения", "💼 Работа", "💰 Финансы", "🌟 Общий расклад"], state=TarotStates.waiting_for_topic)
-async def choose_topic(message: types.Message, state: FSMContext):
-    topic = message.text.replace("🔮 ", "").replace("💼 ", "").replace("💰 ", "").replace("🌟 ", "")
-    await state.update_data(topic=topic)
-    await message.answer(f"📝 Опишите, пожалуйста, вашу ситуацию по теме *{topic}*.", reply_markup=types.ReplyKeyboardRemove())
-    await TarotStates.waiting_for_situation.set()
-
-@dp.message_handler(state=TarotStates.waiting_for_situation)
-async def describe_situation(message: types.Message, state: FSMContext):
-    await state.update_data(situation=message.text)
-    await message.answer("Выберите тип расклада:", reply_markup=spread_kb())
-    await TarotStates.waiting_for_spread.set()
-
-@dp.message_handler(lambda m: m.text in ["1 карта", "3 карты", "Кельтский крест"], state=TarotStates.waiting_for_spread)
-async def make_spread(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    topic, situation = data["topic"], data["situation"]
-    spread_type = message.text
-
-    if spread_type == "1 карта":
-        n = 1
-    elif spread_type == "3 карты":
-        n = 3
-    else:
-        n = 10
-
-    drawn = draw_cards(n)
-    interpretation = interpret_cards(drawn, situation, topic, spread_type)
-
-    # Отправляем карты
-    media = [types.InputMediaPhoto(card["image"], caption=f"{card['title']} ({'перевёрнутая' if card['is_reversed'] else 'прямая'})") if i == 0 else types.InputMediaPhoto(card["image"]) for i, card in enumerate(drawn)]
-    await message.answer_media_group(media)
-
-    # Отправляем текст
-    await message.answer(interpretation, parse_mode="Markdown")
-
-    save_history(message.from_user.id, {"topic": topic, "situation": situation, "spread": spread_type, "cards": drawn})
-
-    await state.finish()
-
-# ================== ВЕБХУК ==================
-async def on_startup(dp):
-    await bot.set_webhook(WEBHOOK_URL)
-    logger.info(f"Webhook установлен: {WEBHOOK_URL}")
-
-async def on_shutdown(dp):
-    await bot.delete_webhook()
-
-if __name__ == "__main__":
-    start_webhook(
-        dispatcher=dp,
-        webhook_path=WEBHOOK_PATH,
-        skip_updates=True,
-        on_startup=on_startup,
-        on_shutdown=on_shutdown,
-        host=WEBAPP_HOST,
-        port=WEBAPP_PORT,
+async def cmd_start(message: types.Message):
+    user_id = str(message.from_user.id)
+    await message.answer(
+        "Привет! 🙌 Я Таро-бот.\nВыберите тему для расклада:",
+        reply_markup=menu_kb
     )
+    user_state[user_id] = "choose_topic"
+
+@dp.message_handler(lambda m: m.text in ["🔮 Отношения", "💼 Работа", "💰 Финансы", "🌌 Общий расклад"])
+async def choose_topic(message: types.Message):
+    user_id = str(message.from_user.id)
+    topic = message.text
+    user_topic[user_id] = topic
+    user_state[user_id] = "describe_situation"
+    await message.answer("Опиши, пожалуйста, свою ситуацию подробнее…")
+
+@dp.message_handler(lambda m: user_state.get(str(m.from_user.id)) == "describe_situation")
+async def describe_situation(message: types.Message):
+    user_id = str(message.from_user.id)
+    user_situation[user_id] = message.text
+    user_state[user_id] = "choose_spread"
+    await message.answer("Какой расклад сделаем?", reply_markup=spreads_kb())
+
+@dp.message_handler(lambda m: m.text in ["1 карта", "3 карты", "Кельтский крест"])
+async def choose_spread(message: types.Message):
+    user_id = str(message.from_user.id)
+    topic = user_topic.get(user_id, "Общий")
+    situation = user_situation.get(user_id, "—")
+
+    if message.text == "1 карта":
+        cards = draw_cards(1)
+    elif message.text == "3 карты":
+        cards = draw_cards(3)
+    else:
+        cards = draw_cards(10)
+
+    result = []
+    for idx, card in enumerate(cards, start=1):
+        interpretation = format_interpretation(card, position=idx)
+        photo_url = IMAGE_BASE_URL + card["image"]
+        await message.answer_photo(photo=photo_url, caption=interpretation)
+        result.append(interpretation)
+
+    summary = final_summary(topic, situation, cards)
+    await message.answer(summary, reply_markup=menu_kb)
+
+    # Сохраняем историю
+    HISTORY.setdefault(user_id, deque(maxlen=5))
+    HISTORY[user_id].appendleft({
+        "topic": topic,
+        "situation": situation,
+        "cards": [c["title_ru"] for c in cards],
+        "summary": summary
+    })
+    save_history()
+
+    user_state[user_id] = "choose_topic"
+
+# ---------------- RUN ----------------
+if __name__ == "__main__":
+    logger.info("Бот запущен")
+    executor.start_polling(dp, skip_updates=True)
