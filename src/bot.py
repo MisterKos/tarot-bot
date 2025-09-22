@@ -1,179 +1,180 @@
-# -*- coding: utf-8 -*-
-"""
-Telegram бот: Таро Онлайн (Райдер–Уэйт)
-aiogram 2.25.1, long-polling (Render free plan совместим)
-
-Переменные окружения:
-- BOT_TOKEN  — токен бота от BotFather
-- DECK_URL   — (необязательно) URL до deck.json; используется как фолбэк
-Локальный JSON берётся из data/deck.json (если присутствует в репозитории).
-"""
-
 import os
 import json
 import random
 import logging
+from typing import List, Dict, Any
+
 import requests
-from aiogram import Bot, Dispatcher, executor, types
+from aiogram import Bot, Dispatcher, types
+from aiogram.utils.executor import start_webhook
 
-# -----------------------
-# Настройки/инициализация
-# -----------------------
-logging.basicConfig(level=logging.INFO)
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DECK_URL = os.getenv("DECK_URL", "").strip()
+# ----------------------------
+# ENV
+# ----------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+DECK_URL = os.getenv("DECK_URL", "").strip()  # jsDelivr URL к deck.json
 
 if not BOT_TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN в переменных окружения.")
+    raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
 
+# Render отдаёт внешний адрес сервиса в переменной RENDER_EXTERNAL_URL
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+# Под какой порт слушаем (Render задаёт PORT)
+WEBAPP_HOST = "0.0.0.0"
+WEBAPP_PORT = int(os.getenv("PORT", "10000"))
+
+# Путь вебхука (делаем “секретным” — включаем токен)
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+# Полный URL вебхука. Если Render дал внешний URL — используем его.
+if RENDER_EXTERNAL_URL:
+    WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
+else:
+    # запасной вариант: если переменной нет (локальный запуск)
+    WEBHOOK_URL = f"http://localhost:{WEBAPP_PORT}{WEBHOOK_PATH}"
+
+# ----------------------------
+# ЛОГИ
+# ----------------------------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("tarot-bot")
+
+# ----------------------------
+# БОТ/ДИСПЕТЧЕР
+# ----------------------------
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
-# -----------------------
-# Загрузка колоды (JSON)
-# -----------------------
-deck = {"code": "rw", "name_ru": "Райдер–Уэйт (классика)", "reversals_percent": 30, "cards": []}
-cards = []
+# ----------------------------
+# ЗАГРУЗКА КОЛОДЫ
+# ----------------------------
+deck: Dict[str, Any] = {"cards": []}
 
-try:
-    # 1) Пытаемся прочитать локальный файл
-    with open("data/deck.json", "r", encoding="utf-8") as f:
-        deck = json.load(f)
-        cards = deck.get("cards", [])
-        print(f"Колода успешно загружена локально: {len(cards)} карт.")
-except Exception as e:
-    logging.error(f"Не удалось прочитать локальную колоду: {e}")
-    # 2) Фолбэк: пробуем URL, если задан
-    try:
-        if DECK_URL:
+def load_deck() -> Dict[str, Any]:
+    """
+    Пытаемся прочитать локальный data/deck.json,
+    если нет — тянем по DECK_URL (jsDelivr) и кешируем в памяти.
+    """
+    # 1) локальный файл (на всякий случай)
+    local_path = "data/deck.json"
+    if os.path.exists(local_path):
+        try:
+            with open(local_path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                log.info("Колода загружена локально: %s карт", len(d.get("cards", [])))
+                return d
+        except Exception as e:
+            log.warning("Не удалось прочитать локальную колоду: %r", e)
+
+    # 2) CDN
+    if DECK_URL:
+        try:
             r = requests.get(DECK_URL, timeout=10)
             r.raise_for_status()
-            deck = r.json()
-            cards = deck.get("cards", [])
-            print(f"Колода загружена по URL: {len(cards)} карт.")
-        else:
-            print("DECK_URL не задан и локальная колода недоступна.")
-    except Exception as e2:
-        logging.error(f"Фатально: не удалось загрузить колоду ни локально, ни по URL: {e2}")
-        deck = {"cards": []}
-        cards = []
-
-IMAGE_BASE = (deck.get("image_base_url") or "").strip()
-
-# -----------------------
-# Вспомогательные функции
-# -----------------------
-def roll_orientation() -> bool:
-    """True -> перевёрнутая, False -> прямая."""
-    rev_pct = int(deck.get("reversals_percent", 30) or 0)
-    return random.randint(1, 100) <= rev_pct
-
-def card_title(card: dict, reversed_: bool) -> str:
-    name = card.get("title_ru") or card.get("title_en") or card.get("code", "карта")
-    return f"{name} {'(перевёрнутая)' if reversed_ else ''}"
-
-def card_meaning(card: dict, reversed_: bool) -> str:
-    key = "reversed" if reversed_ else "upright"
-    text = (card.get(key) or "").strip()
-    return text
-
-def card_image_url(card: dict) -> str:
-    """Вернёт абсолютный URL изображения, если возможно (иначе пустую строку).
-    Важно: Telegram предпочитает HTTPS для фото. Если у вас только HTTP,
-    лучше отправлять текст + ссылку, а не photo.
-    """
-    img_name = (card.get("image") or "").strip()
-    if not IMAGE_BASE or not img_name:
-        return ""
-    # гарантируем одиночный слэш
-    base = IMAGE_BASE
-    if not base.endswith("/"):
-        base += "/"
-    return base + img_name
-
-async def send_card(message: types.Message, card: dict, reversed_: bool, position_hint: str = ""):
-    """Отправляет карту. Если HTTPS-картинки нет — шлём текст с ссылкой."""
-    title = card_title(card, reversed_)
-    meaning = card_meaning(card, reversed_)
-    url = card_image_url(card)
-
-    header = f"**{position_hint + ': ' if position_hint else ''}{title}**"
-    body = f"\n{meaning}" if meaning else ""
-    caption_md = (header + body).strip()
-
-    # Если url начинается на https — пробуем прислать фото; иначе только текст + ссылка
-    if url.startswith("https://"):
-        try:
-            await message.answer_photo(
-                url,
-                caption=caption_md,
-                parse_mode="Markdown"
-            )
-            return
+            d = r.json()
+            log.info("Колода загружена с %s: %s карт", DECK_URL, len(d.get("cards", [])))
+            return d
         except Exception as e:
-            logging.warning(f"Не удалось отправить фото по {url}: {e}")
+            log.error("Не удалось загрузить колоду по URL (%s): %r", DECK_URL, e)
 
-    # текстовый вариант (для http-ссылок и любых ошибок)
-    if url:
-        caption_md += f"\n\n[Изображение карты]({url})"
-    await message.answer(caption_md, parse_mode="Markdown", disable_web_page_preview=False)
+    log.error("Колода не загружена ни локально, ни по URL — работаю с пустой.")
+    return {"cards": []}
 
-# -----------------------
-# Команды
-# -----------------------
-START_TEXT = (
-    "Привет! Я бот для онлайн-раскладов на Таро Райдер–Уэйт.\n\n"
-    "Доступные команды:\n"
-    "/one — 1 карта (совет/подсказка)\n"
-    "/three — 3 карты (прошлое/настоящее/будущее)\n"
-    "/help — как пользоваться ботом\n"
-)
+deck = load_deck()
+cards: List[Dict[str, Any]] = deck.get("cards", [])
+image_base_url = deck.get("image_base_url", "").rstrip("/")
 
-HELP_TEXT = (
-    "Этот бот делает онлайн-расклады на Таро Райдер–Уэйт.\n\n"
-    "Доступные быстрые расклады:\n"
-    "• /one — одна карта (совет / подсказка)\n"
-    "• /three — три карты (прошлое / настоящее / будущее)\n\n"
-    "_Помните: карты — это инструмент для размышлений, а не приговор._\n"
-    "Все решения в жизни вы принимаете самостоятельно. Всегда есть выбор — "
-    "и есть последствия этого выбора."
-)
-
-@dp.message_handler(commands=["start"])
-async def cmd_start(message: types.Message):
-    await message.answer(START_TEXT)
-
-@dp.message_handler(commands=["help"])
-async def cmd_help(message: types.Message):
-    await message.answer(HELP_TEXT, parse_mode="Markdown")
-
-@dp.message_handler(commands=["deck"])
-async def cmd_deck(message: types.Message):
-    name = deck.get("name_ru") or deck.get("name_en") or deck.get("code", "колода")
-    await message.answer(f"Активная колода: *{name}*. Карт: {len(cards)}.", parse_mode="Markdown")
-
-@dp.message_handler(commands=["one"])
-async def cmd_one(message: types.Message):
+# ----------------------------
+# ХЕЛПЕРЫ
+# ----------------------------
+def pick_random_card() -> Dict[str, Any]:
     if not cards:
-        await message.answer("Колода не загружена. Попробуйте позже.")
+        return {}
+    card = random.choice(cards).copy()
+    # решаем ориентацию
+    reversed_percent = deck.get("reversals_percent", 30)
+    is_reversed = random.randint(1, 100) <= reversed_percent
+    card["is_reversed"] = is_reversed
+    return card
+
+def card_caption(card: Dict[str, Any]) -> str:
+    title_ru = card.get("title_ru") or card.get("title_en") or "Карта"
+    orientation = "Перевёрнутая" if card.get("is_reversed") else "Прямая"
+    return f"{title_ru}\n{orientation}"
+
+def card_image_url(card: Dict[str, Any]) -> str:
+    img_name = card.get("image", "")
+    if not img_name:
+        return ""
+    if image_base_url:
+        return f"{image_base_url}/{img_name}"
+    return img_name  # на случай, если уже полный URL
+
+# ----------------------------
+# ХЕНДЛЕРЫ
+# ----------------------------
+@dp.message_handler(commands=["start", "help"])
+async def start_help(m: types.Message):
+    text = (
+        "Привет! Я Таро-бот 🔮\n\n"
+        "Команды:\n"
+        "/card — вытянуть случайную карту\n"
+        "/three — три карты (прошлое/настоящее/будущее)\n"
+    )
+    await m.reply(text)
+
+@dp.message_handler(commands=["card"])
+async def one_card(m: types.Message):
+    card = pick_random_card()
+    if not card:
+        await m.reply("Колода пока недоступна 😕")
         return
-    card = random.choice(cards)
-    reversed_ = roll_orientation()
-    await send_card(message, card, reversed_)
+    caption = card_caption(card)
+    img_url = card_image_url(card)
+    if img_url:
+        await m.answer_photo(photo=img_url, caption=caption)
+    else:
+        await m.reply(caption)
 
 @dp.message_handler(commands=["three"])
-async def cmd_three(message: types.Message):
+async def three_cards(m: types.Message):
     if len(cards) < 3:
-        await message.answer("Недостаточно карт в колоде. Попробуйте позже.")
+        await m.reply("Карточек пока мало для трёхкартного расклада 😕")
         return
-    picks = random.sample(cards, 3)
-    labels = ["Прошлое", "Настоящее", "Будущее"]
-    for i, card in enumerate(picks):
-        await send_card(message, card, roll_orientation(), position_hint=labels[i])
+    chosen = random.sample(cards, 3)
+    for i, card in enumerate(chosen, start=1):
+        card = card.copy()
+        reversed_percent = deck.get("reversals_percent", 30)
+        card["is_reversed"] = random.randint(1, 100) <= reversed_percent
+        caption = f"{i}/3 • " + card_caption(card)
+        img_url = card_image_url(card)
+        if img_url:
+            await m.answer_photo(photo=img_url, caption=caption)
+        else:
+            await m.reply(caption)
 
-# -----------------------
-# Запуск поллинга
-# -----------------------
+# ----------------------------
+# ВЕБХУКИ (aiogram v2)
+# ----------------------------
+async def on_startup(dp: Dispatcher):
+    # ставим вебхук
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    log.info("Webhook установлен: %s", WEBHOOK_URL)
+
+async def on_shutdown(dp: Dispatcher):
+    log.info("Удаляю вебхук…")
+    await bot.delete_webhook()
+
+def main():
+    # запуск веб-сервера aiohttp, который слушает PORT и принимает вебхуки
+    start_webhook(
+        dispatcher=dp,
+        webhook_path=WEBHOOK_PATH,
+        on_startup=on_startup,
+        on_shutdown=on_shutdown,
+        skip_updates=True,
+        host=WEBAPP_HOST,
+        port=WEBAPP_PORT,
+    )
+
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    main()
