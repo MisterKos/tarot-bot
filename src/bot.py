@@ -119,7 +119,7 @@ def deck_init():
 deck_init()
 
 # =========================
-# Helpers: cards & text
+# Helpers: text & cooldown
 # =========================
 CATEGORIES = [
     ("relationships", "❤️ Отношения"),
@@ -132,6 +132,15 @@ CATEGORIES = [
 
 def _is_blank(val: Optional[str]) -> bool:
     return not val or val.strip() == "" or val.strip() == "…"
+
+def format_mmss(seconds: int) -> str:
+    m = seconds // 60
+    s = seconds % 60
+    if m and s:
+        return f"{m} мин {s} сек"
+    if m:
+        return f"{m} мин"
+    return f"{s} сек"
 
 def pick_card() -> Dict[str, Any]:
     c = random.choice(cards).copy()
@@ -174,9 +183,7 @@ def summarize_reading(topic: str, category_code: str, picked: List[Dict[str, Any
         "Помните: решения принимаете вы. Любой выбор тянет последствия — выбирайте то, что поддерживает вас в долгую."
     )
 
-# =========================
-# Helpers: cooldown & history
-# =========================
+# ----- cooldown & history -----
 def get_last_ts(user_id: int) -> Optional[int]:
     with _db() as conn:
         cur = conn.execute("SELECT last_ts FROM cooldown WHERE user_id=?", (user_id,))
@@ -186,7 +193,8 @@ def get_last_ts(user_id: int) -> Optional[int]:
 def set_last_ts(user_id: int, ts: int):
     with _db() as conn:
         conn.execute(
-            "INSERT INTO cooldown(user_id, last_ts) VALUES(?, ?) ON CONFLICT(user_id) DO UPDATE SET last_ts=excluded.last_ts",
+            "INSERT INTO cooldown(user_id, last_ts) VALUES(?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET last_ts=excluded.last_ts",
             (user_id, ts),
         )
         conn.commit()
@@ -203,6 +211,12 @@ def check_cooldown(user_id: int) -> Tuple[bool, int]:
     if diff >= COOLDOWN_SECONDS:
         return True, 0
     return False, COOLDOWN_SECONDS - diff
+
+def cooldown_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🔄 Проверить", callback_data="cooldown:check"))
+    kb.add(InlineKeyboardButton("⬅️ Меню", callback_data="menu:open"))
+    return kb
 
 def save_history(user_id: int, spread: str, category: str, topic: str, picked: List[Dict[str, Any]]):
     payload = {
@@ -267,7 +281,7 @@ def kb_categories(prefix: str) -> InlineKeyboardMarkup:
     return kb
 
 # =========================
-# Handlers: menu & help
+# Commands & menu
 # =========================
 @dp.message_handler(commands=["start", "help", "menu"])
 async def start_menu(m: types.Message, state: FSMContext):
@@ -279,8 +293,42 @@ async def start_menu(m: types.Message, state: FSMContext):
     await m.answer(text, reply_markup=kb_main())
     await Flow.choosing_spread.set()
 
+@dp.message_handler(commands=["status"])
+async def status_cmd(m: types.Message):
+    allowed, left = check_cooldown(m.from_user.id)
+    cd_text = "Готово к раскладу ✅" if allowed else f"Осталось: {format_mmss(left)}"
+    await m.answer(
+        "Статус:\n"
+        f"— Колода: {len(cards)} карт\n"
+        f"— Кулдаун: {cd_text}"
+    )
+
+@dp.message_handler(commands=["resetwebhook"])
+async def reset_webhook(m: types.Message):
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    await m.reply(f"Webhook переустановлен:\n{WEBHOOK_URL}")
+
 # =========================
-# Handlers: open history
+# Cooldown controls
+# =========================
+@dp.callback_query_handler(lambda c: c.data == "cooldown:check", state="*")
+async def cooldown_check(cq: CallbackQuery, state: FSMContext):
+    allowed, left = check_cooldown(cq.from_user.id)
+    if allowed:
+        await cq.message.answer("Можно делать новый расклад ✅", reply_markup=kb_main())
+        await Flow.choosing_spread.set()
+    else:
+        await cq.message.answer(f"Ещё рано. Осталось: {format_mmss(left)}", reply_markup=cooldown_kb())
+    await cq.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "menu:open", state="*")
+async def menu_open(cq: CallbackQuery, state: FSMContext):
+    await cq.message.answer("Меню:", reply_markup=kb_main())
+    await Flow.choosing_spread.set()
+    await cq.answer()
+
+# =========================
+# History open
 # =========================
 @dp.callback_query_handler(lambda c: c.data == "history:open", state="*")
 async def open_history(cq: CallbackQuery, state: FSMContext):
@@ -297,20 +345,28 @@ async def open_history(cq: CallbackQuery, state: FSMContext):
     await cq.answer()
 
 # =========================
-# Handlers: choose spread
+# Choose spread
 # =========================
+async def enforce_cooldown_or_menu(message_obj, user_id: int) -> bool:
+    """Возвращает True если ДАЛЬШЕ НЕЛЬЗЯ (сработал кулдаун и уже отправили клавиатуру проверки)."""
+    allowed, left = check_cooldown(user_id)
+    if allowed:
+        return False
+    # показать проверку
+    if isinstance(message_obj, types.Message):
+        await message_obj.answer(f"Подождите ещё {format_mmss(left)} 🙏", reply_markup=cooldown_kb())
+    else:
+        # fallback
+        await bot.send_message(user_id, f"Подождите ещё {format_mmss(left)} 🙏", reply_markup=cooldown_kb())
+    return True
+
 @dp.callback_query_handler(lambda c: c.data.startswith("spread:"), state=Flow.choosing_spread)
 async def choose_spread(cq: CallbackQuery, state: FSMContext):
-    spread = cq.data.split(":", 1)[1]  # one | three
-
-    # cooldown check
-    allowed, left = check_cooldown(cq.from_user.id)
-    if not allowed:
-        mins = max(1, left // 60)
-        await cq.message.answer(f"Подождите ещё {mins} мин. чтобы не перегружать бота 🙏")
+    if await enforce_cooldown_or_menu(cq.message, cq.from_user.id):
         await cq.answer()
         return
 
+    spread = cq.data.split(":", 1)[1]  # one | three
     if spread == "one":
         await state.update_data(spread="one")
         await cq.message.answer("Выберите тему:", reply_markup=kb_categories("cat_one"))
@@ -326,7 +382,32 @@ async def choose_spread(cq: CallbackQuery, state: FSMContext):
     await cq.answer()
 
 # =========================
-# Handlers: categories → topic input
+# Fallback: /card & /three (тоже с кулдауном)
+# =========================
+@dp.message_handler(commands=["card"])
+async def cmd_card(m: types.Message, state: FSMContext):
+    if await enforce_cooldown_or_menu(m, m.from_user.id):
+        return
+    if not cards:
+        await m.reply("Колода пока недоступна 😕")
+        return
+    await state.update_data(spread="one")
+    await m.reply("Выберите тему:", reply_markup=kb_categories("cat_one"))
+    await Flow.choosing_category_for_one.set()
+
+@dp.message_handler(commands=["three"])
+async def cmd_three(m: types.Message, state: FSMContext):
+    if await enforce_cooldown_or_menu(m, m.from_user.id):
+        return
+    if len(cards) < 3:
+        await m.reply("Карточек пока мало для 3-картного расклада 😕")
+        return
+    await state.update_data(spread="three")
+    await m.reply("Выберите тему:", reply_markup=kb_categories("cat_three"))
+    await Flow.choosing_category_for_three.set()
+
+# =========================
+# Categories → topic
 # =========================
 @dp.callback_query_handler(lambda c: c.data.startswith("cat_one:"), state=Flow.choosing_category_for_one)
 async def cat_one(cq: CallbackQuery, state: FSMContext):
@@ -345,8 +426,13 @@ async def cat_three(cq: CallbackQuery, state: FSMContext):
     await cq.answer()
 
 # =========================
-# Handlers: do spreads
+# Do spreads
 # =========================
+def pick_and_send_card_message(m: types.Message, caption_prefix: str, card: Dict[str, Any]):
+    cap = caption_prefix + card_caption(card)
+    img = card_image_url(card)
+    return (img, cap)
+
 @dp.message_handler(state=Flow.entering_topic_for_one)
 async def do_one(m: types.Message, state: FSMContext):
     if not cards:
@@ -358,10 +444,8 @@ async def do_one(m: types.Message, state: FSMContext):
     topic = (m.text or "").strip()
     category = data.get("category", "general")
 
-    # pick
     c = pick_card()
-    cap = card_caption(c)
-    img = card_image_url(c)
+    img, cap = pick_and_send_card_message(m, "", c)
     if img:
         await m.answer_photo(photo=img, caption=cap)
     else:
@@ -375,7 +459,6 @@ async def do_one(m: types.Message, state: FSMContext):
     save_history(m.from_user.id, "one", category, topic, [c])
     set_last_ts(m.from_user.id, int(time.time()))
 
-    # back to menu
     await m.answer("Готово. Вернуться в меню:", reply_markup=kb_main())
     await Flow.choosing_spread.set()
 
@@ -394,13 +477,13 @@ async def do_three(m: types.Message, state: FSMContext):
     positions = ["Прошлое", "Настоящее", "Будущее"]
     picked = []
 
-    for i, card in enumerate(chosen):
-        card = card.copy()
+    for i, base in enumerate(chosen):
+        card = base.copy()
         card["is_reversed"] = (random.randint(1, 100) <= reversals_percent)
         picked.append(card)
 
-        cap = f"{positions[i]} • " + card_caption(card)
-        img = card_image_url(card)
+        cap_prefix = f"{positions[i]} • "
+        img, cap = pick_and_send_card_message(m, cap_prefix, card)
         if img:
             await m.answer_photo(photo=img, caption=cap)
         else:
@@ -420,6 +503,10 @@ async def do_three(m: types.Message, state: FSMContext):
 # =========================
 # Webhook lifecycle
 # =========================
+@dp.message_handler(commands=["ping"])
+async def ping(m: types.Message):
+    await m.answer("pong")
+
 async def on_startup(dp_: Dispatcher):
     await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
     log.info("Webhook установлен: %s", WEBHOOK_URL)
