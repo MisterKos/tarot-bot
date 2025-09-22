@@ -1,3 +1,18 @@
+r = requests.get(DECK_URL)
+deck = r.json()
+cards = deck.get("cards", []# Загружаем JSON колоды при старте
+deck = {}
+cards = []
+
+try:
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(DECK_URL, headers=headers, timeout=10)
+    r.raise_for_status()
+    deck = r.json()
+    cards = deck.get("cards", [])
+    logging.info(f"Загружено карт: {len(cards)}")
+except Exception as e:
+    logging.error(f"Не удалось загрузить колоду: {e}")
 import os
 import logging
 import random
