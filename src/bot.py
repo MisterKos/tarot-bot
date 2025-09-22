@@ -80,7 +80,13 @@ async def webhook_handler(request):
         data = await request.json()
     except Exception:
         data = {}
+
     update = types.Update.to_object(data)
+
+    # фикс: подсовываем бота в контекст
+    Bot.set_current(bot)
+    dp.bot = bot
+
     await dp.process_update(update)
     return web.Response(status=200, text="ok")
 
