@@ -1,3 +1,32 @@
+# Загружаем JSON колоды при старте
+import json
+
+deck = {}
+cards = []
+try:
+    with open("data/deck.json", "r", encoding="utf-8") as f:
+        deck = json.load(f)
+        cards = deck.get("cards", [])
+    print(f"Колода успешно загружена: {len(cards)} карт")
+except Exception as e:
+    import logging
+    logging.error(f"Не удалось загрузить колоду: {e}")
+    cards = []# Загружаем JSON колоды при старте
+import json
+
+deck = {}
+cards = []
+try:
+    with open("data/deck.json", "r", encoding="utf-8") as f:
+        deck = json.load(f)
+        cards = deck.get("cards", [])
+        print(f"Колода успешно загружена: {len(cards)} карт")
+except Exception as e:
+    import logging
+    logging.error(f"Не удалось загрузить колоду: {e}")
+    deck = {}
+    cards = []
+
 r = requests.get(DECK_URL)
 deck = r.json()
 cards = deck.get("cards", []# Загружаем JSON колоды при старте
