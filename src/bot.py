@@ -5,7 +5,6 @@ import logging
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.utils.executor import set_webhook
 
 # 🔹 Логирование
 logging.basicConfig(level=logging.INFO)
@@ -36,29 +35,38 @@ def menu_kb():
     kb.add(KeyboardButton("Общий расклад 🔮"))
     return kb
 
-# 🔹 Состояние пользователей (что выбрали и ждём ли описания)
+# 🔹 Состояния пользователей
 user_state = {}
 
 # 📌 Итоговый анализ как у таролога
 def generate_summary(theme, situation, cards):
-    texts = []
-    for c in cards:
-        texts.append(f"— {c['name']}: {c['meaning']}")
-    cards_text = "\n".join(texts)
+    cards_text = "\n".join([f"— {c['name']}: {c['meaning']}" for c in cards])
 
-    # Развёрнутый вывод
-    summary = (
+    endings = [
+        (
+            "Этот расклад словно подсвечивает скрытые пружины вашей ситуации. "
+            "Карты намекают, что ключ к изменениям лежит внутри вас. "
+            "Совет: примите происходящее как этап пути, на котором важно сохранять внутреннее равновесие."
+        ),
+        (
+            "Карты словно подталкивают к переоценке привычного. "
+            "Перед вами открываются новые горизонты, но нужно отпустить старые страхи. "
+            "Совет: доверяйте процессу и делайте шаги вперёд, даже если дорога ещё неясна."
+        ),
+        (
+            "Выпавшие карты указывают на важный поворот в вашей истории. "
+            "Даже трудности здесь выступают как трамплин для роста. "
+            "Совет: ищите баланс между разумом и чувствами, и тогда ситуация разрешится наилучшим образом."
+        ),
+    ]
+    final_text = random.choice(endings)
+
+    return (
         f"✨ Тема: {theme}\n"
         f"Ваш запрос: {situation}\n\n"
         f"Карты, которые выпали:\n{cards_text}\n\n"
-        f"🔮 Итог расклада:\n"
-        f"В раскладе проявляется важный поворот: каждая карта указывает на внутренние процессы, "
-        f"которые вы уже чувствуете. Здесь есть подсказка — обратить внимание не только на внешние "
-        f"события, но и на своё отношение к ним. Совет расклада: сохранять ясность, доверять "
-        f"своему опыту и не бояться перемен. У вас достаточно ресурсов и поддержки, чтобы выйти "
-        f"на новый уровень. Главное — слушать сердце и действовать уверенно."
+        f"🔮 Итог расклада:\n{final_text}"
     )
-    return summary
 
 # 🔹 Команда /start
 @dp.message_handler(commands=["start"])
@@ -69,7 +77,7 @@ async def cmd_start(m: types.Message):
         reply_markup=menu_kb()
     )
 
-# 🔹 Обработка выбора темы
+# 🔹 Выбор темы
 @dp.message_handler(lambda m: m.text in ["Отношения 💞", "Работа ⚒️", "Финансы 💰", "Общий расклад 🔮"])
 async def on_theme(m: types.Message):
     user_state[m.from_user.id] = {"theme": m.text, "awaiting_situation": True}
@@ -80,31 +88,25 @@ async def on_theme(m: types.Message):
         parse_mode="Markdown"
     )
 
-# 🔹 Получение описания ситуации и расклад
+# 🔹 Описание ситуации + расклад
 @dp.message_handler(lambda m: m.from_user.id in user_state and user_state[m.from_user.id].get("awaiting_situation"))
 async def on_situation(m: types.Message):
     state = user_state[m.from_user.id]
     theme = state["theme"]
     situation = m.text
 
-    # 3 случайные карты
     cards = random.sample(DECK, 3)
-
-    # Итоговый текст
     summary = generate_summary(theme, situation, cards)
 
-    # Отправляем результат
     await m.answer(summary)
-
-    # Сбрасываем состояние
     user_state.pop(m.from_user.id, None)
 
-# 🔹 Любое другое сообщение
+# 🔹 Любой другой текст
 @dp.message_handler()
 async def on_free_text(m: types.Message):
     await m.answer("Выберите тему через меню ниже 👇", reply_markup=menu_kb())
 
-# 🔹 Aiohttp веб-сервер
+# 🔹 Веб-сервер aiohttp
 async def on_startup(app):
     await bot.delete_webhook()
     await bot.set_webhook(WEBHOOK_URL)
@@ -115,9 +117,13 @@ async def on_shutdown(app):
     await bot.close()
 
 async def webhook_handler(request):
-    data = await request.json()
-    update = types.Update.to_object(data)
-    await dp.process_update(update)
+    try:
+        data = await request.json()
+        update = types.Update.to_object(data)
+        if update:
+            await dp.process_update(update)
+    except Exception as e:
+        logger.error(f"Ошибка при обработке апдейта: {e}")
     return web.Response()
 
 app = web.Application()
