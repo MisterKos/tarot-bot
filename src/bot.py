@@ -80,10 +80,8 @@ app.router.add_get("/", handle_root)
 app.router.add_get("/healthz", handle_health)
 app.router.add_head("/", handle_root)
 
-# Webhook endpoint (с токеном в URL)
+# Webhook endpoint (без токена в URL)
 async def webhook_handler(request):
-    if request.match_info.get("token") != BOT_TOKEN:
-        return web.Response(status=403, text="forbidden")
     try:
         data = await request.json()
     except Exception:
@@ -93,7 +91,7 @@ async def webhook_handler(request):
     return web.Response(status=200, text="ok")
 
 
-app.router.add_post(f"/webhook/{{token}}", webhook_handler)
+app.router.add_post("/webhook", webhook_handler)
 
 # -------------------- состояния --------------------
 WAIT_TOPIC: Dict[int, Dict[str, Any]] = {}
@@ -317,7 +315,7 @@ async def on_startup(app_: web.Application):
         log.warning("RENDER_EXTERNAL_URL не задан — webhook не будет установлен.")
         return
 
-    webhook_path = f"/webhook/{BOT_TOKEN}"
+    webhook_path = "/webhook"
     full_url = f"https://{RENDER_EXTERNAL_URL}{webhook_path}"
     try:
         await bot.set_webhook(full_url)
